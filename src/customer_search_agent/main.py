@@ -2,32 +2,121 @@
 
 import os
 import logging
-from typing import Dict, Any, Optional
+import traceback
+from typing import Dict, Any
 from bedrock_agentcore import BedrockAgentCoreApp
-from pydantic import BaseModel, Field
+from pydantic import ValidationError
 
-# Configure logging
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+try:
+    # Try relative imports first (when running as package)
+    from .config import config
+    from .models.data_models import SearchRequest, SearchResponse
+except ImportError:
+    # Fall back to absolute imports (when running directly)
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from config import config
+    from models.data_models import SearchRequest, SearchResponse
+
+# Configure comprehensive logging
+def setup_logging():
+    """Set up logging configuration with proper formatting and levels."""
+    log_level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    
+    # Remove existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    return logging.getLogger(__name__)
+
+# Initialize logging
+logger = setup_logging()
 
 # Initialize the Strands Framework app with AgentCore Runtime deployment
 app = BedrockAgentCoreApp()
 
+# Log startup information
+logger.info("Customer Search Agent initializing...")
+logger.info(f"AI Model: {config.AI_MODEL}")
+logger.info(f"AWS Region: {config.AWS_REGION}")
+logger.info(f"Log Level: {config.LOG_LEVEL}")
 
-class SearchRequest(BaseModel):
-    """Input model for search requests."""
-    search_query: str = Field(..., description="Natural language search query")
-    user_id: Optional[str] = Field(None, description="User identifier for personalisation")
+
+def validate_search_query(query: str) -> str:
+    """
+    Validate and sanitize search query input.
+    
+    Args:
+        query: Raw search query string
+        
+    Returns:
+        Sanitized search query
+        
+    Raises:
+        ValueError: If query is invalid
+    """
+    if not query or not isinstance(query, str):
+        raise ValueError("Search query must be a non-empty string")
+    
+    # Strip whitespace and check length
+    query = query.strip()
+    if len(query) == 0:
+        raise ValueError("Search query cannot be empty")
+    
+    if len(query) > 1000:  # Reasonable limit for search queries
+        raise ValueError("Search query too long (maximum 1000 characters)")
+    
+    # Basic sanitization - remove control characters
+    sanitized = ''.join(char for char in query if ord(char) >= 32 or char in '\t\n\r')
+    
+    return sanitized
 
 
-class SearchResponse(BaseModel):
-    """Output model for search responses."""
-    personalised: str = Field("", description="User-specific content or empty string")
-    summary: str = Field("", description="General summary from knowledge base")
-    links: list[str] = Field(default_factory=list, description="Source URLs and citations")
+def validate_user_id(user_id: str) -> str:
+    """
+    Validate user ID format.
+    
+    Args:
+        user_id: User identifier string
+        
+    Returns:
+        Validated user ID
+        
+    Raises:
+        ValueError: If user ID format is invalid
+    """
+    if not isinstance(user_id, str):
+        raise ValueError("User ID must be a string")
+    
+    user_id = user_id.strip()
+    if len(user_id) == 0:
+        raise ValueError("User ID cannot be empty")
+    
+    if len(user_id) > 255:  # Reasonable limit for user IDs
+        raise ValueError("User ID too long (maximum 255 characters)")
+    
+    # Basic format validation - alphanumeric, hyphens, underscores
+    if not all(c.isalnum() or c in '-_' for c in user_id):
+        raise ValueError("User ID contains invalid characters (only alphanumeric, hyphens, and underscores allowed)")
+    
+    return user_id
 
 
 @app.entrypoint
@@ -35,48 +124,155 @@ async def invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Main entry point for search requests.
     
+    Processes search queries for both authenticated and anonymous users,
+    returning structured JSON responses with summary, personalisation, and citations.
+    
     Args:
-        payload: Dictionary containing search_query and optional user_id
+        payload: Dictionary containing:
+            - search_query (str): Natural language search query
+            - user_id (str, optional): User identifier for personalisation
     
     Returns:
-        Dictionary with personalised, summary, and links fields
+        Dictionary with three fields:
+            - personalised (str): User-specific content or empty string
+            - summary (str): General summary from knowledge base
+            - links (List[str]): Source URLs and citations
     """
+    request_id = id(payload)  # Simple request tracking
+    logger.info(f"[{request_id}] Received search request")
+    
     try:
-        # Validate input
-        request = SearchRequest(**payload)
-        logger.info(f"Processing search query: {request.search_query[:100]}...")
+        # Validate configuration on first request
+        try:
+            config.validate_required_config()
+        except ValueError as config_error:
+            logger.error(f"[{request_id}] Configuration validation failed: {config_error}")
+            return _create_error_response("Service configuration error. Please contact support.")
+        
+        # Validate and parse input payload
+        try:
+            request = SearchRequest(**payload)
+        except ValidationError as validation_error:
+            logger.warning(f"[{request_id}] Input validation failed: {validation_error}")
+            return _create_error_response("Invalid request format. Please check your input parameters.")
+        except Exception as parse_error:
+            logger.error(f"[{request_id}] Unexpected parsing error: {parse_error}")
+            return _create_error_response("Request parsing failed. Please try again.")
+        
+        # Additional input validation and sanitization
+        try:
+            sanitized_query = validate_search_query(request.search_query)
+            validated_user_id = None
+            
+            if request.user_id:
+                validated_user_id = validate_user_id(request.user_id)
+                logger.info(f"[{request_id}] Processing authenticated request for user: {validated_user_id}")
+            else:
+                logger.info(f"[{request_id}] Processing anonymous request")
+            
+            logger.info(f"[{request_id}] Search query: '{sanitized_query[:100]}{'...' if len(sanitized_query) > 100 else ''}'")
+            
+        except ValueError as validation_error:
+            logger.warning(f"[{request_id}] Input validation failed: {validation_error}")
+            return _create_error_response(f"Invalid input: {str(validation_error)}")
         
         # TODO: Implement knowledge retrieval, personalisation, and safety services
         # This is a placeholder response for the initial setup
+        logger.info(f"[{request_id}] Core services not yet implemented - returning placeholder response")
+        
         response = SearchResponse(
-            personalised="",
-            summary="Service initialization complete. Full implementation pending.",
+            personalised="" if not validated_user_id else "Personalisation service pending implementation",
+            summary="Core agent entry point successfully configured. Knowledge retrieval, personalisation, and safety services pending implementation.",
             links=[]
         )
         
-        logger.info("Search request processed successfully")
+        logger.info(f"[{request_id}] Search request processed successfully")
         return response.model_dump()
         
     except Exception as e:
-        logger.error(f"Error processing search request: {str(e)}")
-        # Return error response in expected format
-        return {
-            "personalised": "",
-            "summary": "An error occurred while processing your request. Please try again.",
-            "links": []
-        }
+        # Log full error details for debugging
+        logger.error(f"[{request_id}] Unexpected error processing search request: {str(e)}")
+        logger.error(f"[{request_id}] Error traceback: {traceback.format_exc()}")
+        
+        # Return user-friendly error response
+        return _create_error_response("An unexpected error occurred while processing your request. Please try again.")
+
+
+def _create_error_response(error_message: str) -> Dict[str, Any]:
+    """
+    Create a standardized error response in the expected JSON format.
+    
+    Args:
+        error_message: User-friendly error message
+        
+    Returns:
+        Dictionary with error response in standard format
+    """
+    return {
+        "personalised": "",
+        "summary": error_message,
+        "links": []
+    }
 
 
 if __name__ == "__main__":
-    # For local testing
+    # For local testing and validation
     import asyncio
     
     async def test_local():
-        test_payload = {
-            "search_query": "What are the benefits of cloud computing?",
-            "user_id": "test-user-123"
-        }
-        result = await invoke(test_payload)
-        print(f"Response: {result}")
+        """Test the agent entry point with various scenarios."""
+        logger.info("Starting local testing...")
+        
+        # Test cases for validation
+        test_cases = [
+            {
+                "name": "Valid authenticated request",
+                "payload": {
+                    "search_query": "What are the benefits of cloud computing?",
+                    "user_id": "test-user-123"
+                }
+            },
+            {
+                "name": "Valid anonymous request",
+                "payload": {
+                    "search_query": "How does machine learning work?"
+                }
+            },
+            {
+                "name": "Invalid empty query",
+                "payload": {
+                    "search_query": "",
+                    "user_id": "test-user"
+                }
+            },
+            {
+                "name": "Invalid missing query",
+                "payload": {
+                    "user_id": "test-user"
+                }
+            },
+            {
+                "name": "Invalid user ID format",
+                "payload": {
+                    "search_query": "test query",
+                    "user_id": "invalid@user#id"
+                }
+            }
+        ]
+        
+        for test_case in test_cases:
+            print(f"\n--- Testing: {test_case['name']} ---")
+            try:
+                result = await invoke(test_case['payload'])
+                print(f"Success: {result}")
+            except Exception as e:
+                print(f"Error: {e}")
+        
+        logger.info("Local testing completed")
     
-    asyncio.run(test_local())
+    # Only run if environment variables are set or in development mode
+    try:
+        asyncio.run(test_local())
+    except Exception as e:
+        print(f"Local testing failed: {e}")
+        print("Note: This is expected if required environment variables are not set")
