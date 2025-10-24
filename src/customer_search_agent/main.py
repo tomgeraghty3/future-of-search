@@ -3,7 +3,7 @@
 import os
 import logging
 from typing import Dict, Any, Optional
-from strands_agents import BedrockAgentCoreApp
+from bedrock_agentcore import BedrockAgentCoreApp
 from pydantic import BaseModel, Field
 
 # Configure logging
