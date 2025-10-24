@@ -27,10 +27,7 @@ class Config:
     # Logging Configuration
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
-    # Retry Configuration
-    KNOWLEDGE_BASE_RETRIES: int = int(os.getenv("KNOWLEDGE_BASE_RETRIES", "3"))
-    PERSONALISATION_RETRIES: int = int(os.getenv("PERSONALISATION_RETRIES", "2"))
-    GUARDRAILS_RETRIES: int = int(os.getenv("GUARDRAILS_RETRIES", "2"))
+
     
     @classmethod
     def validate_required_config(cls) -> None:

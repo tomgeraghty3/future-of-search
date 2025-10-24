@@ -24,9 +24,6 @@ spec:
     MAX_TOKENS: "4096"
     TEMPERATURE: "0.1"
     RESPONSE_TIMEOUT: "30"
-    KNOWLEDGE_BASE_RETRIES: "3"
-    PERSONALISATION_RETRIES: "2"
-    GUARDRAILS_RETRIES: "2"
   
   # Entry point
   entrypoint: "src.customer_search_agent.main:app"

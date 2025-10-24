@@ -11,6 +11,7 @@ try:
     # Try relative imports first (when running as package)
     from .config import config
     from .models.data_models import SearchRequest, SearchResponse
+    from .services.knowledge_retrieval import KnowledgeRetrievalService
 except ImportError:
     # Fall back to absolute imports (when running directly)
     import sys
@@ -18,6 +19,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from config import config
     from models.data_models import SearchRequest, SearchResponse
+    from services.knowledge_retrieval import KnowledgeRetrievalService
 
 # Configure comprehensive logging
 def setup_logging():
@@ -52,11 +54,22 @@ logger = setup_logging()
 # Initialize the Strands Framework app with AgentCore Runtime deployment
 app = BedrockAgentCoreApp()
 
+# Initialize services
+knowledge_service = None
+
 # Log startup information
 logger.info("Customer Search Agent initializing...")
 logger.info(f"AI Model: {config.AI_MODEL}")
 logger.info(f"AWS Region: {config.AWS_REGION}")
 logger.info(f"Log Level: {config.LOG_LEVEL}")
+
+
+def get_knowledge_service() -> KnowledgeRetrievalService:
+    """Get or create the knowledge retrieval service instance."""
+    global knowledge_service
+    if knowledge_service is None:
+        knowledge_service = KnowledgeRetrievalService()
+    return knowledge_service
 
 
 def validate_search_query(query: str) -> str:
@@ -176,14 +189,38 @@ async def invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning(f"[{request_id}] Input validation failed: {validation_error}")
             return _create_error_response(f"Invalid input: {str(validation_error)}")
         
-        # TODO: Implement knowledge retrieval, personalisation, and safety services
-        # This is a placeholder response for the initial setup
-        logger.info(f"[{request_id}] Core services not yet implemented - returning placeholder response")
+        # Initialize knowledge retrieval service
+        knowledge_svc = get_knowledge_service()
+        
+        # Retrieve information from knowledge base
+        logger.info(f"[{request_id}] Querying knowledge base...")
+        try:
+            retrieval_result = await knowledge_svc.retrieve_and_generate(sanitized_query)
+            logger.info(f"[{request_id}] Knowledge base query completed - confidence: {retrieval_result.confidence_score:.2f}")
+        except Exception as kb_error:
+            logger.error(f"[{request_id}] Knowledge base query failed: {str(kb_error)}")
+            retrieval_result = None
+        
+        # TODO: Implement personalisation and safety services
+        # For now, we'll use the knowledge base results directly
+        
+        # Assemble response
+        if retrieval_result and retrieval_result.summary:
+            summary = retrieval_result.summary
+            links = retrieval_result.citations
+        else:
+            summary = "No AI summary could be found for the specified query"
+            links = []
+        
+        # Personalisation placeholder (will be implemented in later tasks)
+        personalised_content = ""
+        if validated_user_id:
+            logger.info(f"[{request_id}] Personalisation service not yet implemented for user: {validated_user_id}")
         
         response = SearchResponse(
-            personalised="" if not validated_user_id else "Personalisation service pending implementation",
-            summary="Core agent entry point successfully configured. Knowledge retrieval, personalisation, and safety services pending implementation.",
-            links=[]
+            personalised=personalised_content,
+            summary=summary,
+            links=links
         )
         
         logger.info(f"[{request_id}] Search request processed successfully")
