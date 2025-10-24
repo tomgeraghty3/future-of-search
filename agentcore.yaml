@@ -1,0 +1,45 @@
+# AgentCore Runtime deployment configuration
+apiVersion: agentcore/v1
+kind: Agent
+metadata:
+  name: customer-search-agent
+  description: "Customer-facing search agent using Strands Framework and AWS services"
+
+spec:
+  # Runtime configuration
+  runtime:
+    memory: "2048MB"
+    timeout: "30s"
+    concurrency: 100
+    
+  # Environment variables
+  environment:
+    KNOWLEDGE_BASE_ID: "${KNOWLEDGE_BASE_ID}"
+    GATEWAY_MCP_URL: "${GATEWAY_MCP_URL}"
+    GUARDRAILS_ID: "${GUARDRAILS_ID}"
+    AWS_REGION: "${AWS_REGION}"
+    AI_MODEL: "claude-3-7-sonnet"
+    GATEWAY_AUTH_REQUIRED: "false"
+    LOG_LEVEL: "INFO"
+    MAX_TOKENS: "4096"
+    TEMPERATURE: "0.1"
+    RESPONSE_TIMEOUT: "30"
+    KNOWLEDGE_BASE_RETRIES: "3"
+    PERSONALISATION_RETRIES: "2"
+    GUARDRAILS_RETRIES: "2"
+  
+  # Entry point
+  entrypoint: "src.customer_search_agent.main:app"
+  
+  # IAM permissions required
+  permissions:
+    - effect: Allow
+      actions:
+        - "bedrock:RetrieveAndGenerate"
+        - "bedrock:InvokeModel"
+        - "bedrock:ApplyGuardrail"
+      resources: ["*"]
+    - effect: Allow
+      actions:
+        - "bedrock-agentcore:InvokeGateway"
+      resources: ["arn:aws:bedrock-agentcore:*:*:gateway/*"]

@@ -1,6 +1,6 @@
 # Implementation Plan
 
-- [ ] 1. Set up project structure and core dependencies
+- [x] 1. Set up project structure and core dependencies
   - Create Strands Framework agent project structure
   - Install required dependencies (strands-agents, boto3, bedrock-agentcore)
   - Configure project for AgentCore Runtime deployment
