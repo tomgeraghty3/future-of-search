@@ -15,14 +15,14 @@
   - Add error handling for no results found, service unavailable, and invalid queries
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
-- [ ] 3. Implement Guardrails Tool for content validation
+- [x] 3. Implement Guardrails Tool for content validation
   - Create guardrails_tool.py with @tool decorator and ToolContext support
   - Implement AWS Bedrock Guardrails client using boto3
   - Add ApplyGuardrail API integration for safety and coherence validation
   - Implement error handling for content blocked, service unavailable, and timeout scenarios
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
-- [ ] 4. Implement Personalisation Tool with MCP Gateway integration
+- [-] 4. Implement Personalisation Tool with MCP Gateway integration
   - Create personalisation_tool.py with @tool decorator and ToolContext support
   - Implement MCP client using Strands MCPClient and streamablehttp_client
   - Add tool discovery functionality using list_tools_sync method
