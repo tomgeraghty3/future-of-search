@@ -146,3 +146,6 @@ cython_debug/
 # Local configuration
 config.local.yaml
 .env.local
+
+
+.DS_Store

@@ -12,6 +12,7 @@ try:
     from .config import config
     from .models.data_models import SearchRequest, SearchResponse
     from .services.knowledge_retrieval import KnowledgeRetrievalService
+    from .services.personalisation import PersonalisationService
 except ImportError:
     # Fall back to absolute imports (when running directly)
     import sys
@@ -20,6 +21,7 @@ except ImportError:
     from config import config
     from models.data_models import SearchRequest, SearchResponse
     from services.knowledge_retrieval import KnowledgeRetrievalService
+    from services.personalisation import PersonalisationService
 
 # Configure comprehensive logging
 def setup_logging():
@@ -56,6 +58,7 @@ app = BedrockAgentCoreApp()
 
 # Initialize services
 knowledge_service = None
+personalisation_service = None
 
 # Log startup information
 logger.info("Customer Search Agent initializing...")
@@ -70,6 +73,14 @@ def get_knowledge_service() -> KnowledgeRetrievalService:
     if knowledge_service is None:
         knowledge_service = KnowledgeRetrievalService()
     return knowledge_service
+
+
+def get_personalisation_service() -> PersonalisationService:
+    """Get or create the personalisation service instance."""
+    global personalisation_service
+    if personalisation_service is None:
+        personalisation_service = PersonalisationService()
+    return personalisation_service
 
 
 def validate_search_query(query: str) -> str:
@@ -189,8 +200,9 @@ async def invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning(f"[{request_id}] Input validation failed: {validation_error}")
             return _create_error_response(f"Invalid input: {str(validation_error)}")
         
-        # Initialize knowledge retrieval service
+        # Initialize services
         knowledge_svc = get_knowledge_service()
+        personalisation_svc = get_personalisation_service()
         
         # Retrieve information from knowledge base
         logger.info(f"[{request_id}] Querying knowledge base...")
@@ -201,8 +213,24 @@ async def invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(f"[{request_id}] Knowledge base query failed: {str(kb_error)}")
             retrieval_result = None
         
-        # TODO: Implement personalisation and safety services
-        # For now, we'll use the knowledge base results directly
+        # Get personalised content if user is authenticated
+        personalised_content = ""
+        if validated_user_id:
+            logger.info(f"[{request_id}] Getting personalised content for user: {validated_user_id}")
+            try:
+                personalisation_result = await personalisation_svc.get_personalised_content(
+                    validated_user_id, 
+                    sanitized_query
+                )
+                if personalisation_result.success and personalisation_result.content:
+                    personalised_content = personalisation_result.content
+                    logger.info(f"[{request_id}] Personalisation successful using tool: {personalisation_result.tool_used}")
+                else:
+                    logger.info(f"[{request_id}] No personalised content available for user")
+            except Exception as personalisation_error:
+                logger.warning(f"[{request_id}] Personalisation failed, continuing with general response: {str(personalisation_error)}")
+        
+        # TODO: Implement safety services (Bedrock Guardrails)
         
         # Assemble response
         if retrieval_result and retrieval_result.summary:
@@ -211,11 +239,6 @@ async def invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             summary = "No AI summary could be found for the specified query"
             links = []
-        
-        # Personalisation placeholder (will be implemented in later tasks)
-        personalised_content = ""
-        if validated_user_id:
-            logger.info(f"[{request_id}] Personalisation service not yet implemented for user: {validated_user_id}")
         
         response = SearchResponse(
             personalised=personalised_content,
