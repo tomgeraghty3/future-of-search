@@ -10,6 +10,8 @@ from strands.models import BedrockModel
 
 from config import Config
 from tools.knowledge_tool import knowledge_tool
+from tools.personalisation_tool import personalisation_tool
+from tools.guardrails_tool import guardrails_tool
 
 
 # Initialize the AgentCore Runtime application
@@ -42,27 +44,38 @@ class CustomerSearchAgent:
     def _initialize_agent(self):
         """Initialize the Strands Agent with system prompt and tools."""
         # System prompt defining agent role and capabilities
-        system_prompt = """You are a customer search agent that helps users find information.
+        system_prompt = """You are an intelligent customer search agent that uses reasoning to help users find information. You have the ability to think through each request and decide the best approach to fulfill it.
 
-You have access to three tools:
+You have access to three tools that you can use strategically:
 1. knowledge_tool: Search the company knowledge base for general information
 2. personalisation_tool: Get personalized information for logged-in users (requires user_id)
 3. guardrails_tool: Validate content for safety and coherence
 
-Your goal is to provide helpful search results in this exact JSON format:
+Your reasoning process should be:
+1. Analyze the user's search request and determine what information they need
+2. Decide which tools to use based on the context (anonymous vs logged-in user)
+3. Use the knowledge_tool to get general information about the topic
+4. If a user_id is provided, use personalisation_tool to get user-specific information
+5. Compose a comprehensive response combining the information
+6. Use guardrails_tool to validate your final response before returning it
+7. Format the final response as JSON
+
+Your final response must be in this exact JSON format:
 {
     "personalised": "User-specific information or empty string if not available",
     "summary": "General information summary with citations", 
     "links": ["list", "of", "source", "urls"]
 }
 
-Guidelines:
-- Always search the knowledge base for general information
-- Only use personalization if user_id is provided
-- Always validate your final response with guardrails
+Important guidelines:
+- Think through each request and adapt your approach based on the user's needs
+- Always search the knowledge base for general information first
+- Only attempt personalization if user_id is provided
+- Always validate your final composed response with guardrails before returning
 - If no knowledge base results exist, return "No AI summary could be found for the specified query"
-- Never fabricate facts, policies, or prices
-- Always cite your sources"""
+- Never fabricate facts, policies, or prices - only use information from your tools
+- Always include source citations and links when available
+- Be helpful and comprehensive while staying accurate and safe"""
 
         # Configure Claude 3.7 Sonnet model
         model_config = BedrockModel(
@@ -71,7 +84,7 @@ Guidelines:
         )
         
         # Configure available tools
-        tools = [knowledge_tool]  # Additional tools will be added in subsequent tasks
+        tools = [knowledge_tool, personalisation_tool, guardrails_tool]
         
         # Create the agent
         self.agent = Agent(
@@ -108,14 +121,19 @@ Guidelines:
                 "request_id": request_id
             }
             
-            # Construct prompt for the agent
+            # Construct prompt for the agent with reasoning context
             prompt = f"""A {user_context} is searching for: "{search_topic}"
 
-Please help them by:
-1. Searching for relevant information in the knowledge base
-2. Getting personalized information if they are logged in
-3. Ensuring the response is safe and appropriate
-4. Returning the results in the required JSON format"""
+Please analyze this request and use your reasoning to provide the best possible response:
+
+1. First, think about what information this user needs for their search topic
+2. Use the knowledge_tool to search for general information about "{search_topic}"
+3. {"If you find relevant information, also use the personalisation_tool to get user-specific details for user_id: " + user_id if user_id else "Since this is an anonymous user, skip personalization"}
+4. Compose a comprehensive response combining all the information you gathered
+5. Use the guardrails_tool to validate your composed response for safety and coherence
+6. Return the final validated response in the required JSON format
+
+Remember to think through each step and adapt your approach based on what you learn from each tool."""
 
             # Let the agent reason about how to fulfill the request
             response = await self.agent.invoke_async(
@@ -140,7 +158,7 @@ Please help them by:
         """Parse agent response into structured format.
         
         Args:
-            response: Raw agent response
+            response: Raw agent response from Strands Agent
             
         Returns:
             Dict with personalised, summary, and links fields
@@ -153,32 +171,76 @@ Please help them by:
                 "links": []
             }
             
-            # Check if response contains the expected JSON format
-            if hasattr(response, 'content') and response.content:
+            # Handle different response formats from Strands Agent
+            content = None
+            if hasattr(response, 'content'):
                 content = response.content
-                
-                # Try to extract JSON from the response
-                import json
-                import re
-                
-                # Look for JSON-like structure in the response
-                json_pattern = r'\{[^{}]*"personalised"[^{}]*"summary"[^{}]*"links"[^{}]*\}'
-                json_match = re.search(json_pattern, content, re.DOTALL)
-                
-                if json_match:
-                    try:
-                        parsed_json = json.loads(json_match.group())
-                        result.update(parsed_json)
-                        return result
-                    except json.JSONDecodeError:
-                        pass
-                
-                # If no JSON found, use the content as summary
-                result["summary"] = content
-                
+            elif hasattr(response, 'text'):
+                content = response.text
+            elif isinstance(response, str):
+                content = response
             elif isinstance(response, dict):
-                # If response is already a dict, use it directly
-                result.update(response)
+                # If response is already a dict, try to use it directly
+                if all(key in response for key in ["personalised", "summary", "links"]):
+                    return response
+                content = response.get('content') or response.get('text') or str(response)
+            
+            if not content:
+                logger.warning("No content found in agent response")
+                return result
+            
+            # Try to extract JSON from the response content
+            import json
+            import re
+            
+            # Look for JSON structure with our required fields
+            # More flexible pattern to handle various JSON formatting
+            json_patterns = [
+                # Complete JSON with all three fields
+                r'\{[^{}]*"personalised"[^{}]*"summary"[^{}]*"links"[^{}]*\}',
+                # JSON that might have the fields in different order
+                r'\{[^{}]*(?:"personalised"|"summary"|"links")[^{}]*(?:"personalised"|"summary"|"links")[^{}]*(?:"personalised"|"summary"|"links")[^{}]*\}',
+                # Any JSON-like structure
+                r'\{[^{}]*"[^"]*"[^{}]*:[^{}]*\}'
+            ]
+            
+            for pattern in json_patterns:
+                json_matches = re.findall(pattern, content, re.DOTALL)
+                for json_match in json_matches:
+                    try:
+                        parsed_json = json.loads(json_match)
+                        if isinstance(parsed_json, dict):
+                            # Update result with any matching fields
+                            if "personalised" in parsed_json:
+                                result["personalised"] = str(parsed_json["personalised"])
+                            if "summary" in parsed_json:
+                                result["summary"] = str(parsed_json["summary"])
+                            if "links" in parsed_json:
+                                links = parsed_json["links"]
+                                if isinstance(links, list):
+                                    result["links"] = [str(link) for link in links]
+                                elif isinstance(links, str):
+                                    # Handle case where links might be a string
+                                    result["links"] = [links] if links else []
+                            
+                            # If we found a complete response, return it
+                            if result["summary"]:  # At minimum we need a summary
+                                return result
+                                
+                    except json.JSONDecodeError:
+                        continue
+            
+            # If no valid JSON found, try to extract information from plain text
+            logger.info("No valid JSON found, parsing as plain text response")
+            
+            # Use the entire content as summary if no JSON structure found
+            result["summary"] = content.strip()
+            
+            # Try to extract any URLs from the content for links
+            url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+            urls = re.findall(url_pattern, content)
+            if urls:
+                result["links"] = list(set(urls))  # Remove duplicates
             
             return result
             
