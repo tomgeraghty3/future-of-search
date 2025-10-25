@@ -14,6 +14,7 @@ from strands.tools.mcp import MCPClient
 from mcp.client.streamable_http import streamablehttp_client
 import asyncio
 import httpx
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,78 @@ class PersonalisationError(Exception):
 
 
 class ToolMatcher:
-    """Handles semantic matching of search topics to available MCP tools"""
+    """Handles semantic matching of search topics to available MCP tools using LLM"""
     
     @staticmethod
-    def find_relevant_tool(available_tools: List[Dict], search_topic: str) -> Optional[Dict]:
+    async def find_relevant_tool(available_tools: List[Dict], search_topic: str, tool_context: ToolContext) -> Optional[Dict]:
         """
-        Find the most relevant tool for a given search topic using semantic matching.
+        Find the most relevant tool for a given search topic using LLM semantic matching.
+        
+        Args:
+            available_tools: List of available MCP tools from Gateway
+            search_topic: User's search query
+            tool_context: ToolContext to access the LLM for semantic matching
+            
+        Returns:
+            Most relevant tool dict or None if no match found
+        """
+        if not available_tools:
+            return None
+            
+        # Prepare tool descriptions for LLM analysis
+        tools_summary = []
+        for i, tool in enumerate(available_tools):
+            tool_info = {
+                "index": i,
+                "name": tool.get('name', ''),
+                "description": tool.get('description', '')
+            }
+            tools_summary.append(tool_info)
+        
+        # Create prompt for LLM to select the most relevant tool
+        selection_prompt = f"""Given the user's search topic: "{search_topic}"
+
+Available personalization tools:
+{json.dumps(tools_summary, indent=2)}
+
+Task: Select the most relevant tool for personalizing the search results based on the user's topic.
+
+Requirements:
+- The tool should be able to provide personalized information related to the search topic
+- Consider tools that can access user-specific data like preferences, history, or account information
+- If no tool is clearly relevant for personalization, respond with "NONE"
+
+Respond with ONLY the index number of the most relevant tool, or "NONE" if no tool is suitable for personalization."""
+
+        try:
+            # Use the LLM to make the selection
+            response = await tool_context.llm.generate_text(selection_prompt)
+            response_text = response.strip()
+            
+            # Parse the response
+            if response_text.upper() == "NONE":
+                return None
+                
+            try:
+                selected_index = int(response_text)
+                if 0 <= selected_index < len(available_tools):
+                    return available_tools[selected_index]
+                else:
+                    logger.warning(f"LLM returned invalid tool index: {selected_index}")
+                    return None
+            except ValueError:
+                logger.warning(f"LLM returned non-numeric response: {response_text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error using LLM for tool selection: {str(e)}")
+            # Fallback to simple keyword matching if LLM fails
+            return ToolMatcher._fallback_keyword_matching(available_tools, search_topic)
+    
+    @staticmethod
+    def _fallback_keyword_matching(available_tools: List[Dict], search_topic: str) -> Optional[Dict]:
+        """
+        Fallback keyword-based matching when LLM is unavailable.
         
         Args:
             available_tools: List of available MCP tools from Gateway
@@ -38,9 +105,6 @@ class ToolMatcher:
         Returns:
             Most relevant tool dict or None if no match found
         """
-        if not available_tools:
-            return None
-            
         search_topic_lower = search_topic.lower()
         best_match = None
         best_score = 0
@@ -49,7 +113,6 @@ class ToolMatcher:
             tool_name = tool.get('name', '').lower()
             tool_description = tool.get('description', '').lower()
             
-            # Simple keyword-based matching - can be enhanced with more sophisticated NLP
             score = 0
             
             # Check for direct keyword matches in tool name
@@ -131,8 +194,8 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                     logger.error(f"[{request_id}] Failed to list tools from Gateway: {str(e)}")
                     raise PersonalisationError("Failed to discover tools from Gateway")
                 
-                # Find relevant tool for search topic (semantic matching)
-                relevant_tool = ToolMatcher.find_relevant_tool(available_tools, search_topic)
+                # Find relevant tool for search topic (LLM-based semantic matching)
+                relevant_tool = await ToolMatcher.find_relevant_tool(available_tools, search_topic, tool_context)
                 
                 if not relevant_tool:
                     logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
