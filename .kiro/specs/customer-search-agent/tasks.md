@@ -22,7 +22,7 @@
   - Implement error handling for content blocked, service unavailable, and timeout scenarios
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
-- [-] 4. Implement Personalisation Tool with MCP Gateway integration
+- [x] 4. Implement Personalisation Tool with MCP Gateway integration
   - Create personalisation_tool.py with @tool decorator and ToolContext support
   - Implement MCP client using Strands MCPClient and streamablehttp_client
   - Add tool discovery functionality using list_tools_sync method
