@@ -1,0 +1,22 @@
+# Core Strands framework and AgentCore Runtime
+strands-agents
+bedrock-agentcore-starter-toolkit
+
+# AWS SDK for Bedrock services
+boto3
+botocore
+
+# HTTP client for MCP Gateway communication
+httpx
+
+# Data validation and serialization
+pydantic
+
+# Model Context Protocol client
+mcp
+
+# Additional utilities
+uuid
+asyncio
+logging
+json
