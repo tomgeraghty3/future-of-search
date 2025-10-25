@@ -9,6 +9,7 @@ from strands import Agent
 from strands.models import BedrockModel
 
 from config import Config
+from tools.knowledge_tool import knowledge_tool
 
 
 # Initialize the AgentCore Runtime application
@@ -69,8 +70,8 @@ Guidelines:
             region=self.config.aws_region
         )
         
-        # Tools will be imported and configured in subsequent tasks
-        tools = []  # Will be populated when tools are implemented
+        # Configure available tools
+        tools = [knowledge_tool]  # Additional tools will be added in subsequent tasks
         
         # Create the agent
         self.agent = Agent(
@@ -144,13 +145,50 @@ Please help them by:
         Returns:
             Dict with personalised, summary, and links fields
         """
-        # This will be implemented when tools are available
-        # For now, return a basic structure
-        return {
-            "personalised": "",
-            "summary": "Agent response parsing will be implemented with tools",
-            "links": []
-        }
+        try:
+            # Initialize default response structure
+            result = {
+                "personalised": "",
+                "summary": "",
+                "links": []
+            }
+            
+            # Check if response contains the expected JSON format
+            if hasattr(response, 'content') and response.content:
+                content = response.content
+                
+                # Try to extract JSON from the response
+                import json
+                import re
+                
+                # Look for JSON-like structure in the response
+                json_pattern = r'\{[^{}]*"personalised"[^{}]*"summary"[^{}]*"links"[^{}]*\}'
+                json_match = re.search(json_pattern, content, re.DOTALL)
+                
+                if json_match:
+                    try:
+                        parsed_json = json.loads(json_match.group())
+                        result.update(parsed_json)
+                        return result
+                    except json.JSONDecodeError:
+                        pass
+                
+                # If no JSON found, use the content as summary
+                result["summary"] = content
+                
+            elif isinstance(response, dict):
+                # If response is already a dict, use it directly
+                result.update(response)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error parsing agent response: {str(e)}")
+            return {
+                "personalised": "",
+                "summary": "An error occurred while processing the response.",
+                "links": []
+            }
 
 
 # Initialize global agent instance

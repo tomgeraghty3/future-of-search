@@ -7,7 +7,7 @@
   - Create main.py with BedrockAgentCoreApp wrapper and entrypoint decorator
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
 
-- [ ] 2. Implement Knowledge Tool for Bedrock Knowledge Base integration
+- [x] 2. Implement Knowledge Tool for Bedrock Knowledge Base integration
   - Create knowledge_tool.py with @tool decorator and ToolContext support
   - Implement AWS Bedrock Knowledge Base client using boto3
   - Add RetrieveAndGenerate API integration for semantic search

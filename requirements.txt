@@ -14,9 +14,3 @@ pydantic
 
 # Model Context Protocol client
 mcp
-
-# Additional utilities
-uuid
-asyncio
-logging
-json
