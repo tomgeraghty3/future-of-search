@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Any
 from strands import tool, ToolContext
 from strands.tools.mcp import MCPClient
 from mcp.client.streamable_http import streamablehttp_client
+from .cognito_token_manager import CognitoTokenManager, CognitoTokenManagerError
 import asyncio
 import httpx
 import json
@@ -172,71 +173,143 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
             logger.info(f"[{request_id}] No user_id provided, skipping personalization")
             return {"personalised": ""}
             
-        # Create MCP client for Gateway connection
+        # Create MCP client for Gateway connection with authentication
         logger.debug(f"[{request_id}] Connecting to Gateway at {gateway_url}")
         
         try:
-            gateway_mcp_client = MCPClient(lambda: streamablehttp_client(gateway_url))
+            # Check if we have Cognito configuration for authentication
+            cognito_config = {
+                'user_pool_id': tool_context.invocation_state.get("cognito_user_pool_id"),
+                'client_id': tool_context.invocation_state.get("cognito_client_id"),
+                'client_secret': tool_context.invocation_state.get("cognito_client_secret"),
+                'domain': tool_context.invocation_state.get("cognito_domain"),
+                'region': tool_context.invocation_state.get("cognito_region")
+            }
+            
+            # Check if all required Cognito config is present
+            missing_config = [k for k, v in cognito_config.items() if not v and k != 'scope']
+            
+            if missing_config:
+                error_msg = f"Missing required Cognito configuration for Gateway authentication: {missing_config}"
+                logger.error(f"[{request_id}] {error_msg}")
+                raise PersonalisationError(f"Gateway authentication not configured: missing {', '.join(missing_config)}")
+            
+            # Create authenticated MCP client
+            logger.info(f"[{request_id}] Creating authenticated Gateway connection")
+            token_manager = CognitoTokenManager(
+                user_pool_id=cognito_config['user_pool_id'],
+                client_id=cognito_config['client_id'],
+                client_secret=cognito_config['client_secret'],
+                region=cognito_config['region'],
+                domain=cognito_config['domain']
+            )
+            
+            # Get access token
+            access_token = await token_manager.get_access_token()
+            
+            # Create MCP client with Authorization header
+            gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
+                url=gateway_url,
+                headers={"Authorization": f"Bearer {access_token}"}
+            ))
+                
+        except CognitoTokenManagerError as e:
+            logger.error(f"[{request_id}] Cognito authentication failed: {str(e)}")
+            raise PersonalisationError("Gateway authentication failed")
         except Exception as e:
             logger.error(f"[{request_id}] Failed to create MCP client: {str(e)}")
             raise PersonalisationError("Failed to connect to Gateway")
             
-        # Use context manager for MCP session
+        # Use context manager for MCP session with enhanced error handling
+        mcp_session = None
         try:
-            with gateway_mcp_client:
-                logger.debug(f"[{request_id}] Discovering available tools from Gateway")
-                
-                # Discover available tools
-                try:
-                    available_tools = gateway_mcp_client.list_tools_sync()
-                    logger.info(f"[{request_id}] Found {len(available_tools)} available tools")
-                except Exception as e:
-                    logger.error(f"[{request_id}] Failed to list tools from Gateway: {str(e)}")
-                    raise PersonalisationError("Failed to discover tools from Gateway")
-                
-                # Find relevant tool for search topic (LLM-based semantic matching)
-                relevant_tool = await ToolMatcher.find_relevant_tool(available_tools, search_topic, tool_context)
-                
-                if not relevant_tool:
-                    logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
+            # Initialize MCP session with timeout
+            mcp_session = gateway_mcp_client
+            
+            # Use timeout wrapper for MCP operations
+            async def _execute_mcp_operations():
+                with mcp_session:
+                    logger.debug(f"[{request_id}] MCP session established with Gateway")
+                    
+                    # Discover available tools with retry logic
+                    available_tools = None
+                    for attempt in range(2):  # Retry once on failure
+                        try:
+                            available_tools = gateway_mcp_client.list_tools_sync()
+                            logger.info(f"[{request_id}] Found {len(available_tools)} available tools")
+                            break
+                        except Exception as e:
+                            logger.warning(f"[{request_id}] Tool discovery attempt {attempt + 1} failed: {str(e)}")
+                            if attempt == 1:  # Last attempt
+                                raise PersonalisationError("Failed to discover tools from Gateway")
+                            await asyncio.sleep(1)  # Brief delay before retry
+                    
+                    if not available_tools:
+                        logger.info(f"[{request_id}] No tools available from Gateway")
+                        return {"personalised": ""}
+                    
+                    # Find relevant tool for search topic (LLM-based semantic matching)
+                    relevant_tool = await ToolMatcher.find_relevant_tool(available_tools, search_topic, tool_context)
+                    
+                    if not relevant_tool:
+                        logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
+                        return {"personalised": ""}
+                    
+                    tool_name = relevant_tool.get('name')
+                    logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
+                    
+                    # Invoke the tool with user_id and search query with retry logic
+                    for attempt in range(2):  # Retry once on failure
+                        try:
+                            logger.debug(f"[{request_id}] Invoking tool {tool_name} (attempt {attempt + 1})")
+                            
+                            result = gateway_mcp_client.call_tool_sync(
+                                tool_use_id=f"personalization-{tool_use_id}",
+                                name=tool_name,
+                                arguments={
+                                    "user_id": user_id,
+                                    "query": search_topic
+                                }
+                            )
+                            
+                            # Extract content from MCP response
+                            if result and "content" in result:
+                                content_list = result.get("content", [])
+                                if content_list and len(content_list) > 0:
+                                    personalized_content = content_list[0].get("text", "")
+                                    if personalized_content:
+                                        logger.info(f"[{request_id}] Successfully retrieved personalized content")
+                                        return {"personalised": personalized_content}
+                            
+                            logger.info(f"[{request_id}] Tool returned empty or invalid response")
+                            return {"personalised": ""}
+                            
+                        except Exception as e:
+                            logger.warning(f"[{request_id}] Tool execution attempt {attempt + 1} failed for {tool_name}: {str(e)}")
+                            if attempt == 1:  # Last attempt
+                                logger.error(f"[{request_id}] All tool execution attempts failed")
+                                return {"personalised": ""}
+                            await asyncio.sleep(1)  # Brief delay before retry
+                    
                     return {"personalised": ""}
-                
-                tool_name = relevant_tool.get('name')
-                logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
-                
-                # Invoke the tool with user_id and search query
-                try:
-                    logger.debug(f"[{request_id}] Invoking tool {tool_name} with user_id: {user_id}")
+            
+            # Execute MCP operations with timeout
+            return await asyncio.wait_for(_execute_mcp_operations(), timeout=10.0)
                     
-                    result = gateway_mcp_client.call_tool_sync(
-                        tool_use_id=f"personalization-{tool_use_id}",
-                        name=tool_name,
-                        arguments={
-                            "user_id": user_id,
-                            "query": search_topic
-                        }
-                    )
-                    
-                    # Extract content from MCP response
-                    if result and "content" in result:
-                        content_list = result.get("content", [])
-                        if content_list and len(content_list) > 0:
-                            personalized_content = content_list[0].get("text", "")
-                            if personalized_content:
-                                logger.info(f"[{request_id}] Successfully retrieved personalized content")
-                                return {"personalised": personalized_content}
-                    
-                    logger.info(f"[{request_id}] Tool returned empty or invalid response")
-                    return {"personalised": ""}
-                    
-                except Exception as e:
-                    logger.error(f"[{request_id}] Tool execution failed for {tool_name}: {str(e)}")
-                    # Don't raise exception - gracefully degrade to no personalization
-                    return {"personalised": ""}
-                    
+        except asyncio.TimeoutError:
+            logger.error(f"[{request_id}] MCP session timeout")
+            raise PersonalisationError("Gateway request timeout")
         except Exception as e:
             logger.error(f"[{request_id}] MCP session error: {str(e)}")
             raise PersonalisationError("MCP session failed")
+        finally:
+            # Ensure proper cleanup of MCP session
+            if mcp_session:
+                try:
+                    # MCP client cleanup is handled by context manager
+                    logger.debug(f"[{request_id}] MCP session cleanup completed")
+                except Exception as cleanup_error:
+                    logger.warning(f"[{request_id}] MCP session cleanup error: {str(cleanup_error)}")
             
     except PersonalisationError:
         # Re-raise our custom errors

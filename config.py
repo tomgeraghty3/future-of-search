@@ -25,6 +25,14 @@ class Config:
         # AWS AgentCore Gateway configuration
         self.gateway_mcp_url = self._get_required_env("GATEWAY_MCP_URL")
         
+        # Cognito Authentication configuration (optional)
+        self.cognito_user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
+        self.cognito_client_id = os.environ.get("COGNITO_CLIENT_ID")
+        self.cognito_client_secret = os.environ.get("COGNITO_CLIENT_SECRET")
+        self.cognito_domain = os.environ.get("COGNITO_DOMAIN")
+        self.cognito_region = os.environ.get("COGNITO_REGION")
+        self.cognito_scope = os.environ.get("COGNITO_SCOPE", "openid")
+        
         # AWS Region configuration
         self.aws_region = os.environ.get("AWS_REGION", "us-east-1")
         
@@ -52,6 +60,12 @@ class Config:
             "guardrail_id": self.guardrail_id,
             "guardrail_version": self.guardrail_version,
             "gateway_mcp_url": self.gateway_mcp_url,
+            "cognito_user_pool_id": self.cognito_user_pool_id,
+            "cognito_client_id": self.cognito_client_id,
+            "cognito_client_secret": self.cognito_client_secret,
+            "cognito_domain": self.cognito_domain,
+            "cognito_region": self.cognito_region,
+            "cognito_scope": self.cognito_scope,
             "aws_region": self.aws_region,
             "response_timeout": self.response_timeout,
             "agent_name": self.agent_name,

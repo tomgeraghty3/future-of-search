@@ -15,6 +15,10 @@ from strands.models import BedrockModel
 from config import Config
 from tools.knowledge_tool import knowledge_tool
 from tools.personalisation_tool import personalisation_tool, PersonalisationError
+from tools.cognito_token_manager import CognitoTokenManager, CognitoTokenManagerError
+from strands.tools.mcp import MCPClient
+from mcp.client.streamable_http import streamablehttp_client
+import httpx
 from tools.guardrails_tool import guardrails_tool
 
 
@@ -796,6 +800,118 @@ async def health_check():
         return {"status": "unhealthy", "error": str(e)}
 
 
+async def create_authenticated_mcp_client(gateway_url: str, token_manager: CognitoTokenManager):
+    """
+    Create MCP client with Cognito authentication.
+    
+    Args:
+        gateway_url: Gateway MCP endpoint URL
+        token_manager: Configured CognitoTokenManager instance
+        
+    Returns:
+        Authenticated MCPClient instance
+    """
+    
+    # Get access token
+    access_token = await token_manager.get_access_token()
+    
+    # Create MCP client with Authorization header
+    mcp_client = MCPClient(lambda: streamablehttp_client(
+        url=gateway_url,
+        headers={"Authorization": f"Bearer {access_token}"}
+    ))
+    
+    return mcp_client
+
+
+async def test_gateway_connection():
+    """Test Gateway MCP connection with Cognito authentication and list available tools for debugging."""
+    try:
+        config = get_config()
+        gateway_url = config.gateway_mcp_url
+        
+        if not gateway_url:
+            logger.error("Gateway MCP URL not configured")
+            return
+            
+        logger.info(f"Testing Gateway connection at: {gateway_url}")
+        
+        # Check if we have Cognito configuration
+        cognito_config = {
+            'user_pool_id': getattr(config, 'cognito_user_pool_id', None),
+            'client_id': getattr(config, 'cognito_client_id', None),
+            'client_secret': getattr(config, 'cognito_client_secret', None),
+            'domain': getattr(config, 'cognito_domain', None),
+            'region': getattr(config, 'cognito_region', config.aws_region)
+        }
+        
+        # Check if all required Cognito config is present
+        missing_config = [k for k, v in cognito_config.items() if not v and k != 'scope']
+        if missing_config:
+            error_msg = f"Missing required Cognito configuration for Gateway authentication: {missing_config}"
+            logger.error(error_msg)
+            logger.error("Gateway connection requires authentication. Please configure:")
+            for key in missing_config:
+                logger.error(f"  {key.upper()}")
+            return None
+        
+        # Create token manager with Cognito configuration
+        logger.info("Creating Cognito token manager...")
+        try:
+            token_manager = CognitoTokenManager(
+                user_pool_id=cognito_config['user_pool_id'],
+                client_id=cognito_config['client_id'],
+                client_secret=cognito_config['client_secret'],
+                region=cognito_config['region'],
+                domain=cognito_config['domain']
+            )
+            
+            # Create authenticated MCP client
+            gateway_mcp_client = await create_authenticated_mcp_client(gateway_url, token_manager)
+            logger.info("Authenticated MCP client created successfully")
+            
+        except CognitoTokenManagerError as e:
+            logger.error(f"Cognito authentication failed: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create authenticated MCP client: {str(e)}")
+            return None
+            
+        # Test MCP session and tool discovery
+        try:
+            with gateway_mcp_client:
+                logger.info("MCP session established with Gateway")
+                
+                # Discover available tools
+                available_tools = gateway_mcp_client.list_tools_sync()
+                logger.info(f"Successfully discovered {len(available_tools)} tools from Gateway")
+                
+                # Log details of each tool
+                for i, tool in enumerate(available_tools):
+                    tool_name = getattr(tool, 'tool_name', getattr(tool, 'name', 'Unknown'))
+                    tool_description = getattr(tool, 'description', 'No description')
+                    logger.info(f"Tool {i+1}: {tool_name}")
+                    logger.info(f"  Description: {tool_description}")
+                    
+                    # Log the full tool structure for debugging
+                    logger.debug(f"  Full tool data: {tool}")
+                
+                return available_tools
+                
+        except Exception as e:
+            logger.error(f"MCP session error: {str(e)}")
+            if "401" in str(e) or "Unauthorized" in str(e):
+                logger.error("Authentication failed - check your Cognito configuration")
+            return None
+            
+    except httpx.ConnectError as e:
+        logger.error(f"Gateway connection failed: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error testing Gateway: {str(e)}")
+        return None
+
+
 if __name__ == "__main__":
     """Local development entry point with enhanced logging."""
     try:
@@ -808,6 +924,14 @@ if __name__ == "__main__":
         logger.info(f"Guardrail ID: {config.guardrail_id}")
         logger.info(f"Gateway URL: {config.gateway_mcp_url}")
         
+        # Test Gateway connection before starting the agent
+        logger.info("Testing Gateway connection...");
+        tools = asyncio.run(test_gateway_connection())
+        if tools:
+            logger.info("Gateway connection test successful")
+        else:
+            logger.warning("Gateway connection test failed - continuing anyway")
+
         # Initialize agent to validate configuration
         get_agent()
         logger.info("Agent initialization successful")
