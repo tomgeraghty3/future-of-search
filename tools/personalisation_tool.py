@@ -231,18 +231,13 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                 with mcp_session:
                     logger.debug(f"[{request_id}] MCP session established with Gateway")
                     
-                    # Discover available tools with retry logic
-                    available_tools = None
-                    for attempt in range(2):  # Retry once on failure
-                        try:
-                            available_tools = gateway_mcp_client.list_tools_sync()
-                            logger.info(f"[{request_id}] Found {len(available_tools)} available tools")
-                            break
-                        except Exception as e:
-                            logger.warning(f"[{request_id}] Tool discovery attempt {attempt + 1} failed: {str(e)}")
-                            if attempt == 1:  # Last attempt
-                                raise PersonalisationError("Failed to discover tools from Gateway")
-                            await asyncio.sleep(1)  # Brief delay before retry
+                    # Discover available tools
+                    try:
+                        available_tools = gateway_mcp_client.list_tools_sync()
+                        logger.info(f"[{request_id}] Found {len(available_tools)} available tools")
+                    except Exception as e:
+                        logger.error(f"[{request_id}] Tool discovery failed: {str(e)}")
+                        raise PersonalisationError("Failed to discover tools from Gateway")
                     
                     if not available_tools:
                         logger.info(f"[{request_id}] No tools available from Gateway")
@@ -258,38 +253,34 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                     tool_name = relevant_tool.get('name')
                     logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
                     
-                    # Invoke the tool with user_id and search query with retry logic
-                    for attempt in range(2):  # Retry once on failure
-                        try:
-                            logger.debug(f"[{request_id}] Invoking tool {tool_name} (attempt {attempt + 1})")
-                            
-                            result = gateway_mcp_client.call_tool_sync(
-                                tool_use_id=f"personalization-{tool_use_id}",
-                                name=tool_name,
-                                arguments={
-                                    "user_id": user_id,
-                                    "query": search_topic
-                                }
-                            )
-                            
-                            # Extract content from MCP response
-                            if result and "content" in result:
-                                content_list = result.get("content", [])
-                                if content_list and len(content_list) > 0:
-                                    personalized_content = content_list[0].get("text", "")
-                                    if personalized_content:
-                                        logger.info(f"[{request_id}] Successfully retrieved personalized content")
-                                        return {"personalised": personalized_content}
-                            
-                            logger.info(f"[{request_id}] Tool returned empty or invalid response")
-                            return {"personalised": ""}
-                            
-                        except Exception as e:
-                            logger.warning(f"[{request_id}] Tool execution attempt {attempt + 1} failed for {tool_name}: {str(e)}")
-                            if attempt == 1:  # Last attempt
-                                logger.error(f"[{request_id}] All tool execution attempts failed")
-                                return {"personalised": ""}
-                            await asyncio.sleep(1)  # Brief delay before retry
+                    # Invoke the tool with user_id and search query
+                    try:
+                        logger.debug(f"[{request_id}] Invoking tool {tool_name}")
+                        
+                        result = gateway_mcp_client.call_tool_sync(
+                            tool_use_id=f"personalization-{tool_use_id}",
+                            name=tool_name,
+                            arguments={
+                                "user_id": user_id,
+                                "query": search_topic
+                            }
+                        )
+                        
+                        # Extract content from MCP response
+                        if result and "content" in result:
+                            content_list = result.get("content", [])
+                            if content_list and len(content_list) > 0:
+                                personalized_content = content_list[0].get("text", "")
+                                if personalized_content:
+                                    logger.info(f"[{request_id}] Successfully retrieved personalized content")
+                                    return {"personalised": personalized_content}
+                        
+                        logger.info(f"[{request_id}] Tool returned empty or invalid response")
+                        return {"personalised": ""}
+                        
+                    except Exception as e:
+                        logger.error(f"[{request_id}] Tool execution failed for {tool_name}: {str(e)}")
+                        raise PersonalisationError(f"Failed to execute personalization tool: {str(e)}")
                     
                     return {"personalised": ""}
             
