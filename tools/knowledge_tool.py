@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Any, Optional
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
-from strands.tools import tool, ToolContext
+from strands import tool, ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +57,20 @@ async def knowledge_tool(search_topic: str, tool_context: ToolContext) -> Dict[s
         
         # Prepare the retrieve and generate request
         request_params = {
-            'knowledgeBaseId': knowledge_base_id,
             'input': {
                 'text': search_topic
+            },
+            'retrieveAndGenerateConfiguration': {
+                'type': 'KNOWLEDGE_BASE',
+                'knowledgeBaseConfiguration': {
+                    'knowledgeBaseId': knowledge_base_id
+                }
             }
         }
         
         # Add model configuration if provided
         if knowledge_base_model_arn:
-            request_params['retrieveAndGenerateConfiguration'] = {
-                'type': 'KNOWLEDGE_BASE',
-                'knowledgeBaseConfiguration': {
-                    'knowledgeBaseId': knowledge_base_id,
-                    'modelArn': knowledge_base_model_arn
-                }
-            }
+            request_params['retrieveAndGenerateConfiguration']['knowledgeBaseConfiguration']['modelArn'] = knowledge_base_model_arn
         
         logger.debug(f"Calling Bedrock Knowledge Base [{request_id}:{tool_use_id}] with params: {request_params}")
         
@@ -101,6 +100,7 @@ async def knowledge_tool(search_topic: str, tool_context: ToolContext) -> Dict[s
         cleaned_summary = _clean_summary_text(generated_text)
         
         logger.info(f"Successfully retrieved knowledge [{request_id}:{tool_use_id}] with {len(extracted_links)} source links")
+        # logger.info("With resultant summary: " + cleaned_summary + " \nand original\n" + generated_text + "\nwith cit:" + str(citations))
         
         return {
             "summary": cleaned_summary,
@@ -175,12 +175,20 @@ def _extract_links_from_citations(citations: List[Dict[str, Any]]) -> List[str]:
                 
                 # Check various possible URL fields
                 url = None
-                if 'uri' in location:
+                
+                # Check for webLocation structure (most common for web sources)
+                if 'webLocation' in location and 'url' in location['webLocation']:
+                    url = location['webLocation']['url']
+                # Check for direct location fields
+                elif 'uri' in location:
                     url = location['uri']
                 elif 'url' in location:
                     url = location['url']
                 elif 'source' in location:
                     url = location['source']
+                # Check metadata fields
+                elif 'x-amz-bedrock-kb-source-uri' in metadata:
+                    url = metadata['x-amz-bedrock-kb-source-uri']
                 elif 'uri' in metadata:
                     url = metadata['uri']
                 elif 'url' in metadata:
