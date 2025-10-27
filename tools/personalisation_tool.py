@@ -5,7 +5,7 @@ This tool integrates with AWS AgentCore Gateway via MCP protocol to provide
 personalized information for logged-in users. The Gateway acts as an MCP server
 that exposes external tools/APIs as MCP tools.
 """
-
+import boto3
 import logging
 import uuid
 from typing import Dict, List, Optional, Any
@@ -85,10 +85,21 @@ Requirements:
 Respond with ONLY the index number of the most relevant tool, or "NONE" if no tool is suitable for personalization."""
 
         try:
+            inv = getattr(tool_context, "invocation_state", {}) or {}
+            region = inv.get("AWS_REGION", "us-east-1")
+            model_id = inv.get("model_id", "anthropic.claude-3-sonnet-20240229-v1:0")
+
             # Use the LLM to make the selection
-            response = await tool_context.llm.generate_text(selection_prompt)
-            response_text = response.strip()
-            
+            bedrock = boto3.client("bedrock-runtime", region_name=region)
+
+            resp = bedrock.converse(
+              modelId=model_id,
+              system=[{"text": selection_prompt}],
+              messages=[{"role": "user", "content": [{"text": search_topic}]}],
+            )
+
+            response_text = resp["output"]["message"]["content"][0]["text"]
+
             # Parse the response
             if response_text.upper() == "NONE":
                 logger.info("The LLM returned a response of NONE for Personalisation - there is no tool in the Gateway for this query")
