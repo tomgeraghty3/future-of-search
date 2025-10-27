@@ -1,229 +1,134 @@
 """
-Guardrails Tool for AWS Bedrock Guardrails integration.
+LLM-Driven Guardrails Tool (simple & readable)
 
-This tool validates content for safety and coherence using AWS Bedrock Guardrails
-before responses are returned to users.
+This tool asks an LLM (via AWS Bedrock) to evaluate a response against
+a set of "good practice" guardrails plus any user-provided guardrails.
+It must end with one of:
+  - "Accepted"
+  - "Accepted with changes (<bulleted list of changes>)"
+  - "Rejected"
 """
 
-import boto3
-import logging
-from typing import Dict, Any
-from strands.tools import tool, ToolContext
-from botocore.exceptions import ClientError, BotoCoreError
 import json
+from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+import boto3
+from strands.tools import tool
+from strands import ToolContext
+
+
+# --- System prompt with concise, good-practice guardrails --- #
+SYSTEM_GUARDRAILS = """
+You are a rigorous content reviewer. Evaluate the provided CONTENT against these guardrails.
+
+Core Good-Practice Guardrails:
+1) Safety & Legality: No self-harm instructions, illicit activity guidance, or unsafe practices.
+2) Harassment/Hate: No hateful, harassing, or dehumanizing content toward protected classes or individuals.
+3) Sexual Content & Minors: No sexual content involving minors; avoid explicit content unless clearly educational and necessary.
+4) Violence: No glorification of violence or instructions for harm.
+5) Privacy & PII: Do not reveal private or identifying information about real people without consent.
+6) IP & Attribution: No clear plagiarism; respect copyrights; cite or paraphrase responsibly.
+7) Medical/Legal/Financial Care: Avoid definitive professional advice; add disclaimers and encourage consulting qualified professionals.
+8) Factuality: Avoid fabrications; clearly label uncertainty; provide sources if cited.
+9) Security: No malware, exploits, or steps for hacking, bypassing controls, or data exfiltration.
+10) Data Sensitivity: Do not output secrets, credentials, or private keys.
+11) Bias & Fairness: Avoid harmful stereotypes; use neutral, inclusive language.
+12) Brand/Policy Alignment: Flag content that contradicts stated platform or org policies.
+13) Clarity & Tone: Aim for clear, coherent, and helpful communication; avoid gratuitous profanity.
+14) Scope & Relevance: Ensure content addresses the user’s request without unnecessary, risky detours.
+
+If USER_GUARDRAILS are provided, apply them in addition to the above; if there is a direct conflict, USER_GUARDRAILS take priority unless they permit clear harm or illegality.
+
+OUTPUT FORMAT (strict JSON):
+{
+  "decision": "accept" | "accept_with_changes" | "reject",
+  "changes": [ "short, actionable edits if any" ],
+  "rationale": "one short paragraph explaining the decision"
+}
+
+After you return JSON, the caller will convert it to a final human result string.
+Return only JSON. Do not include extra text.
+""".strip()
+
+
+def _build_user_guardrails_block(user_guardrails: Optional[List[str]]) -> str:
+    if not user_guardrails:
+        return "USER_GUARDRAILS: (none provided)"
+    lines = "\n".join(f"- {g.strip()}" for g in user_guardrails if g and g.strip())
+    return f"USER_GUARDRAILS:\n{lines}"
 
 
 @tool(context=True)
-async def guardrails_tool(response_content: str, tool_context: ToolContext) -> Dict[str, Any]:
+async def guardrails_tool(
+    response_content: str,
+    tool_context: ToolContext,
+    user_guardrails: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
-    Validate response content using AWS Bedrock Guardrails for safety and coherence.
-    
-    This tool ensures all agent responses meet safety standards and content quality
-    requirements before being returned to users.
-    
-    Args:
-        response_content: The generated response content to validate
-        tool_context: Provides access to agent context and invocation state
-                     - tool_context.invocation_state: Contains guardrail configuration
-                     - tool_context.tool_use: Current tool invocation details
-    
-    Returns:
-        Dict containing:
-        - is_valid: Boolean indicating if content passed validation
-        - validated_content: The approved content (may be filtered)
-        - validation_message: Human-readable validation result
-    
-    Raises:
-        Exception: For unrecoverable validation errors
+    Evaluate 'response_content' using an LLM with a system prompt of guardrails.
+    Returns a dict with:
+      - result: one of "Accepted", "Accepted with changes (...)", "Rejected"
+      - changes: list of changes if any
+      - rationale: brief reason
+      - raw_json: original parsed JSON from the model
     """
+    # --- Config (simple, overridable via invocation_state) --- #
+    inv = getattr(tool_context, "invocation_state", {}) or {}
+    region = inv.get("AWS_REGION", "us-east-1")
+    model_id = inv.get("model_id", "anthropic.claude-3-5-sonnet-20241022-v2:0")  # change if needed
+
+    # --- Compose the single user message --- #
+    user_block = _build_user_guardrails_block(user_guardrails)
+    user_message = f"""
+Evaluate the following CONTENT against the guardrails.
+
+{user_block}
+
+CONTENT:
+\"\"\"{response_content}\"\"\"
+""".strip()
+
+    # --- Call Bedrock (Converse API) --- #
+    bedrock = boto3.client("bedrock-runtime", region_name=region)
+
+    resp = bedrock.converse(
+        modelId=model_id,
+        system=[{"text": SYSTEM_GUARDRAILS}],
+        messages=[{"role": "user", "content": [{"text": user_message}]}],
+    )
+
+    text_out = resp["output"]["message"]["content"][0]["text"]
+
+    # --- Parse the JSON response from the model --- #
     try:
-        # Extract configuration from invocation state
-        guardrail_id = tool_context.invocation_state.get("guardrail_id")
-        guardrail_version = tool_context.invocation_state.get("guardrail_version", "DRAFT")
-        request_id = tool_context.invocation_state.get("request_id", "unknown")
-        
-        if not guardrail_id:
-            logger.error(f"Request {request_id}: Missing guardrail_id in invocation state")
-            raise ValueError("Guardrail configuration not found")
-        
-        # Initialize Bedrock Runtime client
-        bedrock_runtime = boto3.client('bedrock-runtime')
-        
-        logger.info(f"Request {request_id}: Validating content with guardrail {guardrail_id}")
-        
-        # Apply guardrail validation
-        response = bedrock_runtime.apply_guardrail(
-            guardrailIdentifier=guardrail_id,
-            guardrailVersion=guardrail_version,
-            source='OUTPUT',  # We're validating agent output
-            content=[
-                {
-                    'text': {
-                        'text': response_content
-                    }
-                }
-            ]
-        )
-        
-        # Parse guardrail response
-        action = response.get('action', 'NONE')
-        outputs = response.get('outputs', [])
-        assessments = response.get('assessments', [])
-        
-        if action == 'GUARDRAIL_INTERVENED':
-            # Content was blocked by guardrails
-            logger.warning(f"Request {request_id}: Content blocked by guardrails")
-            
-            # Extract policy violations for logging
-            violations = _extract_policy_violations(assessments)
-            logger.warning(f"Request {request_id}: Policy violations: {violations}")
-            
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Content blocked due to safety policy violations"
-            }
-        
-        elif action == 'NONE':
-            # Content passed validation
-            validated_content = response_content
-            
-            # Check if content was modified (filtered)
-            if outputs and len(outputs) > 0:
-                output_text = outputs[0].get('text', response_content)
-                if output_text != response_content:
-                    validated_content = output_text
-                    logger.info(f"Request {request_id}: Content was filtered by guardrails")
-            
-            logger.info(f"Request {request_id}: Content validation successful")
-            
-            return {
-                "is_valid": True,
-                "validated_content": validated_content,
-                "validation_message": "Content approved"
-            }
-        
-        else:
-            # Unexpected action
-            logger.error(f"Request {request_id}: Unexpected guardrail action: {action}")
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Validation failed due to unexpected response"
-            }
-    
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        error_message = e.response.get('Error', {}).get('Message', str(e))
-        
-        logger.error(f"Request {request_id}: AWS ClientError - {error_code}: {error_message}")
-        
-        if error_code == 'ThrottlingException':
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Service temporarily unavailable due to high demand"
-            }
-        elif error_code == 'ValidationException':
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Invalid content format for validation"
-            }
-        elif error_code == 'ResourceNotFoundException':
-            logger.error(f"Request {request_id}: Guardrail {guardrail_id} not found")
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Validation service configuration error"
-            }
-        elif error_code == 'AccessDeniedException':
-            logger.error(f"Request {request_id}: Access denied to guardrail {guardrail_id}")
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Validation service access denied"
-            }
-        else:
-            return {
-                "is_valid": False,
-                "validated_content": "",
-                "validation_message": "Validation service temporarily unavailable"
-            }
-    
-    except BotoCoreError as e:
-        logger.error(f"Request {request_id}: BotoCoreError - {str(e)}")
-        return {
-            "is_valid": False,
-            "validated_content": "",
-            "validation_message": "Network error during validation"
-        }
-    
-    except Exception as e:
-        logger.error(f"Request {request_id}: Unexpected error during guardrail validation: {str(e)}")
-        return {
-            "is_valid": False,
-            "validated_content": "",
-            "validation_message": "Validation service temporarily unavailable"
+        payload = json.loads(text_out)
+    except json.JSONDecodeError:
+        # If the model returned non-JSON, fail safely with a rejection
+        payload = {
+            "decision": "reject",
+            "changes": [],
+            "rationale": "Model did not return valid JSON as required by the guardrails prompt.",
         }
 
+    decision = (payload.get("decision") or "").strip().lower()
+    changes = payload.get("changes") or []
+    rationale = payload.get("rationale") or ""
 
-def _extract_policy_violations(assessments: list) -> list:
-    """
-    Extract policy violation details from guardrail assessments.
-    
-    Args:
-        assessments: List of assessment objects from guardrail response
-    
-    Returns:
-        List of violation descriptions
-    """
-    violations = []
-    
-    for assessment in assessments:
-        # Topic policy violations
-        if 'topicPolicy' in assessment:
-            topics = assessment['topicPolicy'].get('topics', [])
-            for topic in topics:
-                topic_name = topic.get('name', 'Unknown Topic')
-                action = topic.get('action', 'BLOCKED')
-                violations.append(f"Topic Policy: {topic_name} ({action})")
-        
-        # Content policy violations (hate, violence, etc.)
-        if 'contentPolicy' in assessment:
-            filters = assessment['contentPolicy'].get('filters', [])
-            for filter_item in filters:
-                filter_type = filter_item.get('type', 'Unknown')
-                action = filter_item.get('action', 'BLOCKED')
-                confidence = filter_item.get('confidence', 'UNKNOWN')
-                violations.append(f"Content Policy: {filter_type} (confidence: {confidence}, action: {action})")
-        
-        # Word policy violations (custom blocked words)
-        if 'wordPolicy' in assessment:
-            custom_words = assessment['wordPolicy'].get('customWords', [])
-            managed_word_lists = assessment['wordPolicy'].get('managedWordLists', [])
-            
-            for word in custom_words:
-                violations.append(f"Word Policy: Custom word blocked")
-            
-            for word_list in managed_word_lists:
-                violations.append(f"Word Policy: Managed word list violation")
-        
-        # Sensitive information policy violations (PII)
-        if 'sensitiveInformationPolicy' in assessment:
-            pii_entities = assessment['sensitiveInformationPolicy'].get('piiEntities', [])
-            regexes = assessment['sensitiveInformationPolicy'].get('regexes', [])
-            
-            for pii in pii_entities:
-                pii_type = pii.get('type', 'Unknown')
-                action = pii.get('action', 'BLOCKED')
-                violations.append(f"PII Policy: {pii_type} ({action})")
-            
-            for regex in regexes:
-                name = regex.get('name', 'Custom Pattern')
-                action = regex.get('action', 'BLOCKED')
-                violations.append(f"Regex Policy: {name} ({action})")
-    
-    return violations
+    # --- Normalize to final human-readable result --- #
+    if decision == "accept":
+        result = "Accepted"
+    elif decision == "accept_with_changes":
+        if changes:
+            bullet_list = "\n- " + "\n- ".join(changes)
+            result = f"Accepted with changes ({bullet_list})"
+        else:
+            result = "Accepted with changes (no specific changes provided)"
+    else:
+        result = "Rejected"
+
+    return {
+        "result": result,
+        "changes": changes,
+        "rationale": rationale,
+        "raw_json": payload,
+    }

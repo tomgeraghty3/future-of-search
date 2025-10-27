@@ -10,11 +10,14 @@ and calls the tool with your test parameters.
 import asyncio
 import logging
 import sys
+import os
+import ssl
 from typing import Dict, Any, Optional
 from config import Config
 from tools.personalisation_tool import personalisation_tool, PersonalisationError
 from strands import ToolContext
 from strands.models import BedrockModel
+import httpx
 
 # Configure logging
 logging.basicConfig(
@@ -22,6 +25,37 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def create_custom_mcp_http_client(headers: Dict[str, str] = None, 
+                                  timeout: httpx.Timeout = None, 
+                                  auth: httpx.Auth = None,
+                                  disable_ssl_verification: bool = False) -> httpx.AsyncClient:
+    """
+    Create a custom HTTP client for MCP with optional SSL verification disabling.
+    
+    Args:
+        headers: HTTP headers
+        timeout: Request timeout
+        auth: Authentication
+        disable_ssl_verification: Whether to disable SSL verification
+        
+    Returns:
+        Configured AsyncClient
+    """
+    # Configure SSL verification
+    if disable_ssl_verification:
+        verify = False
+        logger.warning("SSL verification disabled for MCP client - NOT SAFE FOR PRODUCTION")
+    else:
+        verify = True
+    
+    return httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout or httpx.Timeout(30.0),
+        auth=auth,
+        verify=verify
+    )
 
 
 class MockToolContext:
@@ -131,10 +165,25 @@ async def test_gateway_tools_discovery():
         access_token = await token_manager.get_access_token()
         logger.info("Successfully obtained access token")
         
-        # Create MCP client
+        # Check if SSL verification should be disabled
+        disable_ssl = os.getenv('COGNITO_DISABLE_SSL_VERIFICATION', 'false').lower() == 'true'
+        
+        # Create custom HTTP client factory
+        def custom_httpx_factory(headers=None, timeout=None, auth=None):
+            combined_headers = {"Authorization": f"Bearer {access_token}"}
+            if headers:
+                combined_headers.update(headers)
+            return create_custom_mcp_http_client(
+                headers=combined_headers,
+                timeout=timeout,
+                auth=auth,
+                disable_ssl_verification=disable_ssl
+            )
+        
+        # Create MCP client with custom HTTP client factory
         gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
             url=gateway_url,
-            headers={"Authorization": f"Bearer {access_token}"}
+            httpx_client_factory=custom_httpx_factory
         ))
         
         # Test tools discovery
@@ -191,10 +240,25 @@ async def test_tool_with_specific_tool(search_topic: str, user_id: str, tool_nam
         token_manager = CognitoTokenManager(**cognito_config)
         access_token = await token_manager.get_access_token()
         
-        # Create MCP client
+        # Check if SSL verification should be disabled
+        disable_ssl = os.getenv('COGNITO_DISABLE_SSL_VERIFICATION', 'false').lower() == 'true'
+        
+        # Create custom HTTP client factory
+        def custom_httpx_factory(headers=None, timeout=None, auth=None):
+            combined_headers = {"Authorization": f"Bearer {access_token}"}
+            if headers:
+                combined_headers.update(headers)
+            return create_custom_mcp_http_client(
+                headers=combined_headers,
+                timeout=timeout,
+                auth=auth,
+                disable_ssl_verification=disable_ssl
+            )
+        
+        # Create MCP client with custom HTTP client factory
         gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
             url=gateway_url,
-            headers={"Authorization": f"Bearer {access_token}"}
+            httpx_client_factory=custom_httpx_factory
         ))
         
         # Call specific tool

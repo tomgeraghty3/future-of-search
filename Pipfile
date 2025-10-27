@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+strands-agents = "*"
+bedrock-agentcore-starter-toolkit = "*"
+boto3 = "*"
+botocore = "*"
+httpx = "*"
+pydantic = "*"
+mcp = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.14"
