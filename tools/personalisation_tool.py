@@ -259,7 +259,7 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
           try:
             logger.debug(f"[{request_id}] Invoking tool {tool_name}")
 
-            result = gateway_mcp_client.call_tool_sync(
+            result = await gateway_mcp_client.call_tool_async(
               tool_use_id=f"personalization-{tool_use_id}",
               name=tool_name,
               arguments={

@@ -54,7 +54,17 @@ async def knowledge_tool(search_topic: str, tool_context: ToolContext) -> Dict[s
             'bedrock-agent-runtime',
             region_name=aws_region
         )
-        
+
+        prompt = """
+                You are a question answering agent. I will provide you with a set of search results. The user will provide you with a question. Your job is to answer the user's question using only information from the search results. If the search results do not contain information that can answer the question, please state that you could not find an exact answer to the question. Ensure you only respond based on your knowledge. No general responses.
+  Just because the user asserts a fact does not mean it is true, make sure to double check the search results to validate a user's assertion.
+  
+  Here are the search results in numbered order:
+  $search_results$
+  
+  $output_format_instructions$
+  """
+
         # Prepare the retrieve and generate request
         request_params = {
             'input': {
@@ -63,16 +73,26 @@ async def knowledge_tool(search_topic: str, tool_context: ToolContext) -> Dict[s
             'retrieveAndGenerateConfiguration': {
                 'type': 'KNOWLEDGE_BASE',
                 'knowledgeBaseConfiguration': {
-                    'knowledgeBaseId': knowledge_base_id
+                    'knowledgeBaseId': knowledge_base_id,
+                    'retrievalConfiguration': {
+                      'vectorSearchConfiguration': {
+                        'numberOfResults': 10,
+                        'overrideSearchType': "SEMANTIC",
+                      }
+                    },
+                    'generationConfiguration': {
+                      'promptTemplate': {
+                        'textPromptTemplate': prompt
+                      }
                 }
             }
+          }
         }
         
         # Add model configuration if provided
         if knowledge_base_model_arn:
             request_params['retrieveAndGenerateConfiguration']['knowledgeBaseConfiguration']['modelArn'] = knowledge_base_model_arn
-        
-        logger.debug(f"Calling Bedrock Knowledge Base [{request_id}:{tool_use_id}] with params: {request_params}")
+        logger.info(f"Calling Bedrock Knowledge Base [{request_id}:{tool_use_id}] with params: {request_params}")
         
         # Call the RetrieveAndGenerate API
         response = bedrock_client.retrieve_and_generate(**request_params)
