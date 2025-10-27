@@ -235,29 +235,39 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                     if not relevant_tool:
                         logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
                         return {"personalised": ""}
-                    
+
+
+
+
+
                     # Handle both dict and MCPAgentTool objects
                     if hasattr(relevant_tool, 'name'):
-                        # MCPAgentTool object
-                        tool_name = getattr(relevant_tool, 'name', '')
+                      # MCPAgentTool object
+                      tool_name = getattr(relevant_tool, 'name', '')
+                    elif hasattr(relevant_tool, 'tool_name'):
+                      # MCPAgentTool object with tool_name attribute
+                      tool_name = getattr(relevant_tool, 'tool_name', '')
+                    elif isinstance(relevant_tool, dict):
+                      # Dictionary object
+                      tool_name = relevant_tool.get('tool_name', '')
                     else:
-                        # Dictionary object
-                        tool_name = relevant_tool.get('name')
+                      # Fallback - try to get any name-like attribute
+                      tool_name = getattr(relevant_tool, 'tool_name', getattr(relevant_tool, 'name', 'unknown_tool'))
                     logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
-                    
+
                     # Invoke the tool with user_id and search query
                     try:
                         logger.debug(f"[{request_id}] Invoking tool {tool_name}")
-                        
+
                         result = gateway_mcp_client.call_tool_sync(
-                            tool_use_id=f"personalization-{tool_use_id}",
-                            name=tool_name,
-                            arguments={
-                                "user_id": user_id,
-                                "query": search_topic
-                            }
+                          tool_use_id=f"personalization-{tool_use_id}",
+                          name=tool_name,
+                          arguments={
+                            "UserId": user_id,
+                            "query": search_topic
+                          }
                         )
-                        
+
                         # Extract content from MCP response
                         if result:
                             # Handle both dict and object responses
