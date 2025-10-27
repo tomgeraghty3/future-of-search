@@ -47,23 +47,28 @@ class ToolMatcher:
         # Prepare tool descriptions for LLM analysis
         tools_summary = []
         for i, tool in enumerate(available_tools):
-            # Handle both dict and MCPAgentTool objects
-            if hasattr(tool, 'name'):
-                # MCPAgentTool object
-                tool_info = {
-                    "index": i,
-                    "name": getattr(tool, 'name', ''),
-                    "description": getattr(tool, 'description', '')
-                }
-            else:
-                # Dictionary object
-                tool_info = {
-                    "index": i,
-                    "name": tool.get('name', ''),
-                    "description": tool.get('description', '')
-                }
-            tools_summary.append(tool_info)
-        
+
+          tool_name = getattr(tool, 'tool_name', 'Unknown')
+          tool_spec = getattr(tool, 'tool_spec')
+
+          # Extract description from tool_spec dictionary
+          if isinstance(tool_spec, dict):
+            tool_description = tool_spec.get('description', 'No description')
+          else:
+            # Fallback for other types
+            tool_description = 'No description'
+
+          tool_info = {
+            "index": i,
+            "name": tool_name,
+            "description": tool_description
+          }
+
+          logger.info(f"  {i+1}. {tool_name}: {tool_description} - adding string \"{tool_info}")
+          tools_summary.append(tool_info)
+
+        tools_as_string = json.dumps(tools_summary, indent=2)
+        logger.info(f"Starting LLM Prompt for personalisation: {tools_as_string}")
         # Create prompt for LLM to select the most relevant tool
         selection_prompt = f"""Given the user's search topic: "{search_topic}"
 

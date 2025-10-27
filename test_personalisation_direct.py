@@ -147,8 +147,14 @@ async def test_gateway_tools_discovery():
             for i, tool in enumerate(available_tools):
                 tool_name = getattr(tool, 'tool_name', 'Unknown')
                 tool_spec = getattr(tool, 'tool_spec')
-                logger.info(f"Tool {tool_spec})")
-                tool_description = getattr(tool_spec, 'description', 'No description')
+                
+                # Extract description from tool_spec dictionary
+                if isinstance(tool_spec, dict):
+                    tool_description = tool_spec.get('description', 'No description')
+                else:
+                    # Fallback for other types
+                    tool_description = 'No description'
+                
                 logger.info(f"  {i+1}. {tool_name}: {tool_description}")
             
             return available_tools
