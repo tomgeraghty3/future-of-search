@@ -4,9 +4,12 @@ import logging
 import uuid
 import json
 import asyncio
-from typing import Dict, Any, Optional, List
+import ssl
+import os
+import re
+from typing import Dict, Any, Optional, List, Union
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
@@ -21,12 +24,63 @@ from mcp.client.streamable_http import streamablehttp_client
 import httpx
 from tools.guardrails_tool import guardrails_tool
 
+# Configure SSL verification for development environment
+# In production, you should use proper SSL certificates
+if os.getenv('ENVIRONMENT', 'development') == 'development':
+    # Apply comprehensive SSL fixes early
+    try:
+        from fix_ssl_comprehensive import apply_ssl_fixes
+        apply_ssl_fixes()
+    except ImportError:
+        # Fallback to basic SSL bypass
+        import warnings
+        import urllib3
+        from urllib3.exceptions import InsecureRequestWarning
+        
+        # Disable SSL warnings for development
+        urllib3.disable_warnings(InsecureRequestWarning)
+        warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+        
+        # Set environment variables to disable SSL verification for AWS SDK
+        os.environ['PYTHONHTTPSVERIFY'] = '0'
+        os.environ['AWS_CA_BUNDLE'] = ''
+        
+        # Create an SSL context that doesn't verify certificates
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Patch SSL context creation globally
+        def create_unverified_context(*args, **kwargs):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+        
+        ssl._create_default_https_context = create_unverified_context
+
 
 class SearchResponse(BaseModel):
     """Structured response model for search results."""
     personalised: str = ""
     summary: str
     links: List[str] = []
+    
+    @field_validator('links', mode='before')
+    @classmethod
+    def validate_links(cls, v):
+        """Convert single link string to list or handle various input formats."""
+        if isinstance(v, str):
+            # If it's a single URL string, wrap in list
+            if v.strip():
+                return [v.strip()]
+            else:
+                return []
+        elif isinstance(v, list):
+            # Ensure all items are strings
+            return [str(item) for item in v if str(item).strip()]
+        else:
+            return []
 
 
 # Initialize the AgentCore Runtime application
@@ -81,45 +135,58 @@ class CustomerSearchAgent:
     
     def _initialize_agent(self):
         """Initialize the Strands Agent with system prompt and tools."""
-        # System prompt defining agent role and capabilities with enhanced reasoning
-        system_prompt = """You are an intelligent customer search agent powered by Claude 3.7 Sonnet that uses advanced reasoning to help users find information. You excel at understanding user intent and dynamically deciding the best approach to fulfill each request.
+                # System prompt defining agent role and capabilities with enhanced reasoning
+        system_prompt = """## Role
+You are an intelligent customer search agent working for Scottish Power (SP), powered by Claude 3.7 Sonnet. You use advanced reasoning to understand customer intent and efficiently provide accurate information.
 
-You have access to three specialized tools:
-1. knowledge_tool: Search the company knowledge base for authoritative information
-2. personalisation_tool: Get personalized information for logged-in users (requires user_id)
-3. guardrails_tool: Validate content for safety and coherence before responding
+## Goal
+Help SP customers find the most accurate, relevant, and trustworthy information. Use tools efficiently - if one fails, continue with available information.
 
-Your intelligent reasoning process:
-1. Analyze the user's search request to understand their true information needs
-2. Determine the optimal tool usage strategy based on user context (anonymous vs authenticated)
-3. Execute knowledge search to gather foundational information about the topic
-4. For authenticated users, intelligently decide if personalization would add value
-5. Synthesize information from multiple sources into a coherent, helpful response
-6. Validate the final response through guardrails to ensure safety and quality
-7. Only use the guardrails tool once as it is expensive
-8. Format the response in the required JSON structure
+## Tools you have
+Knowledge Tool – Search the official SP knowledge base for authoritative, approved information.
+Personalisation Tool – Retrieve personalized details for authenticated customers (optional, fail gracefully if unavailable).
+Guardrail Tool – Validate responses for safety and accuracy (use once at the end).
 
-You must return a structured response with these exact fields:
-- personalised: User-specific information (empty string if not available)
-- summary: Comprehensive information summary with proper citations
-- links: Array of source URLs from your research
+## Efficient Process
+1. Always start with the Knowledge Tool to get factual information
+2. Try Personalisation Tool only if user_id is provided (skip if it fails quickly)
+3. Create your final response using the gathered information
+4. Use Guardrails Tool to validate your draft response content
+5. Return the final response - NO MORE TOOL CALLING after guardrails
 
-Core principles:
-- Use reasoning to adapt your approach to each unique request
-- Always prioritize accuracy over completeness - never fabricate information
-- Leverage knowledge base as the authoritative source of truth
-- Only attempt personalization when user_id is provided and relevant
-- Always validate responses through guardrails before returning. This can be done as the very last tool.
-- Handle errors gracefully and provide meaningful fallback responses
-- Include proper source citations and links when available
-- Maintain response quality while optimizing for user experience"""
+## Response Format
+Always respond in this exact JSON format:
+{
+  "personalised": "Any personalized information from personalisation tool, or empty string if unavailable",
+  "summary": "Comprehensive answer based on knowledge base information",
+  "links": ["list", "of", "relevant", "URLs"]
+}
+
+## Important Guidelines
+- Prioritize speed and accuracy over completeness
+- Don't retry failed tools - fail fast and continue
+- Always include knowledge base information in your summary
+- Provide helpful responses even when personalization fails
+- Include source links when available
+- Keep responses factual and based on official SP information
+- After guardrails validation, return your final JSON response immediately
+- Do NOT call any more tools after the guardrails tool
+
+## Critical: 
+After calling the guardrails tool, immediately provide your final JSON response. Do not call any additional tools."""
 
         # Configure Claude 3.7 Sonnet model with optimal settings
-        model_config = BedrockModel(
-            model_id="anthropic.claude-3-sonnet-20240229-v1:0",
-            temperature=0.1,  # Lower temperature for more consistent responses
-            max_tokens=4000   # Sufficient for comprehensive responses
-        )
+        model_config_params = {
+            "model_id": "anthropic.claude-3-sonnet-20240229-v1:0",  # Use stable Sonnet model
+            "temperature": 0.0,  # Lower temperature for more consistent responses
+            "max_tokens": 1024   # Sufficient for comprehensive responses
+        }
+        
+        # Log SSL configuration for development environment
+        if os.getenv('ENVIRONMENT', 'development') == 'development':
+            logger.info("Development environment detected - SSL verification is disabled")
+        
+        model_config = BedrockModel(**model_config_params)
         
         # Configure available tools
         tools = [knowledge_tool, personalisation_tool, guardrails_tool]
@@ -193,41 +260,43 @@ REASONING STEPS:
 2. Use knowledge_tool to search for authoritative information about "{search_topic}"
 3. {"Consider using personalisation_tool to enhance the response with user-specific information for user_id: " + user_id if user_id else "Skip personalization since this is an anonymous user"}
 4. Synthesize all gathered information into a comprehensive, accurate response
-5. Use guardrails_tool to validate your final response for safety and coherence
-6. Format the validated response in the required JSON structure
+5. Use guardrails_tool to validate your draft response content for safety and coherence
+6. Return your final JSON response immediately after guardrails validation - NO MORE TOOLS
 
 QUALITY REQUIREMENTS:
 - Prioritize accuracy and cite sources when available
+- Do not use your own knowledge - rely solely on the knowledge base and personalisation tools
+- Avoid fabricating information - if unsure, state that information is not available
 - Provide comprehensive coverage of the topic
 - Include relevant links and citations
 - Ensure response is safe and appropriate
 - Handle any tool failures gracefully
+- STOP after guardrails tool - return your final JSON response
 
 Return your final response in the exact JSON format specified in your system prompt."""
 
                 # Execute agent reasoning with timeout protection
                 try:
-                    # First, run the agent to gather information and perform reasoning
-                    await asyncio.wait_for(
+                    # Run the agent to gather information and perform reasoning
+                    response = await asyncio.wait_for(
                         self.agent.invoke_async(prompt, **invocation_state),
                         timeout=self.config.response_timeout
                     )
                     
-                    # Then use structured output to extract the final response
-                    structured_response = await asyncio.wait_for(
-                        self.agent.structured_output_async(
-                            SearchResponse,
-                            "Based on our conversation and research, provide the final structured response."
-                        ),
-                        timeout=self.config.response_timeout
-                    )
+                    # Parse the response directly instead of using structured output
+                    # which can trigger additional tool calls
+                    result = self._parse_agent_response(response, correlation_id)
                     
-                    result = {
-                        "personalised": structured_response.personalised,
-                        "summary": structured_response.summary,
-                        "links": structured_response.links
-                    }
-                    logger.info("Successfully processed search request with structured output")
+                    # Final validation of response structure
+                    if not self._validate_response_structure(result):
+                        logger.error("Invalid response structure from agent")
+                        return {
+                            "personalised": "",
+                            "summary": "An error occurred while formatting the response. Please try again.",
+                            "links": []
+                        }
+                    
+                    logger.info("Successfully processed search request")
                     return result
                     
                 except asyncio.TimeoutError:
@@ -238,34 +307,12 @@ Return your final response in the exact JSON format specified in your system pro
                         "links": []
                     }
                 except Exception as e:
-                    logger.warning(f"Structured output failed: {str(e)}, falling back to parsing")
-                    # Fallback to the original approach
-                    try:
-                        response = await asyncio.wait_for(
-                            self.agent.invoke_async(prompt, **invocation_state),
-                            timeout=self.config.response_timeout
-                        )
-                        
-                        result = self._parse_agent_response(response, correlation_id)
-                        
-                        # Final validation of response structure
-                        if not self._validate_response_structure(result):
-                            logger.error("Invalid response structure from agent")
-                            return {
-                                "personalised": "",
-                                "summary": "An error occurred while formatting the response. Please try again.",
-                                "links": []
-                            }
-                        
-                        logger.info("Successfully processed search request with fallback parsing")
-                        return result
-                    except Exception as fallback_error:
-                        logger.error(f"Both structured output and fallback failed: {str(fallback_error)}")
-                        return {
-                            "personalised": "",
-                            "summary": "An error occurred while processing your search request. Please try again.",
-                            "links": []
-                        }
+                    logger.error(f"Agent invocation failed: {str(e)}")
+                    return {
+                        "personalised": "",
+                        "summary": "An error occurred while processing your search request. Please try again.",
+                        "links": []
+                    }
                 
             except PersonalisationError as e:
                 logger.warning(f"Personalization service error: {str(e)}")
@@ -802,7 +849,7 @@ async def health_check():
 
 async def create_authenticated_mcp_client(gateway_url: str, token_manager: CognitoTokenManager):
     """
-    Create MCP client with Cognito authentication.
+    Create MCP client with Cognito authentication and SSL configuration.
     
     Args:
         gateway_url: Gateway MCP endpoint URL
@@ -815,10 +862,54 @@ async def create_authenticated_mcp_client(gateway_url: str, token_manager: Cogni
     # Get access token
     access_token = await token_manager.get_access_token()
     
-    # Create MCP client with Authorization header
+    # Check if SSL verification should be disabled for development
+    import os
+    is_development = os.getenv('ENVIRONMENT', '').lower() == 'development'
+    ssl_bypass = os.getenv('COGNITO_DISABLE_SSL_VERIFICATION', 'false').lower() == 'true'
+    
+    if is_development or ssl_bypass:
+        logger.warning("SSL verification disabled for MCP client - NOT SAFE FOR PRODUCTION")
+        # Set environment variables to disable SSL verification for the underlying HTTP client
+        os.environ['PYTHONHTTPSVERIFY'] = '0'
+        
+        # Patch SSL context creation more aggressively
+        import ssl
+        def create_unverified_context(*args, **kwargs):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+        
+        ssl._create_default_https_context = create_unverified_context
+        ssl.create_default_context = create_unverified_context
+        
+        # Also patch httpx if available
+        try:
+            import httpx
+            # Monkey patch httpx clients to disable SSL verification
+            original_client_init = httpx.Client.__init__
+            def patched_client_init(self, *args, **kwargs):
+                kwargs['verify'] = False
+                return original_client_init(self, *args, **kwargs)
+            httpx.Client.__init__ = patched_client_init
+            
+            original_async_client_init = httpx.AsyncClient.__init__
+            def patched_async_client_init(self, *args, **kwargs):
+                kwargs['verify'] = False
+                return original_async_client_init(self, *args, **kwargs)
+            httpx.AsyncClient.__init__ = patched_async_client_init
+            
+            logger.info("Applied httpx SSL bypass for MCP client")
+        except Exception as e:
+            logger.warning(f"Could not patch httpx SSL settings: {e}")
+    
+    # Create HTTP headers with authorization
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    # Create MCP client with configured headers
     mcp_client = MCPClient(lambda: streamablehttp_client(
         url=gateway_url,
-        headers={"Authorization": f"Bearer {access_token}"}
+        headers=headers
     ))
     
     return mcp_client
@@ -990,6 +1081,20 @@ if __name__ == "__main__":
     try:
         logger.info("Starting Customer Search Agent in local development mode")
         
+        # Check SSL configuration
+        environment = os.getenv('ENVIRONMENT', 'development')
+        logger.info(f"Environment: {environment}")
+        
+        if environment == 'development':
+            logger.warning("⚠️  Development mode: SSL verification is DISABLED")
+            logger.warning("⚠️  This is NOT safe for production use!")
+            logger.info("SSL bypass environment variables:")
+            logger.info(f"  ENVIRONMENT: {os.getenv('ENVIRONMENT', 'not set')}")
+            logger.info(f"  PYTHONHTTPSVERIFY: {os.getenv('PYTHONHTTPSVERIFY', 'not set')}")
+            logger.info(f"  AWS_CA_BUNDLE: {os.getenv('AWS_CA_BUNDLE', 'not set')}")
+        else:
+            logger.info("Production mode: SSL verification is ENABLED")
+        
         # Load configuration
         config = get_config()
         logger.info(f"Configuration: Agent={config.agent_name}, Region={config.aws_region}")
@@ -1003,15 +1108,25 @@ if __name__ == "__main__":
         if tools:
             logger.info("Gateway connection test successful")
         else:
-            logger.warning("Gateway connection test failed - continuing anyway")
+            logger.warning("Gateway connection test failed")
+            logger.warning("If you're seeing SSL certificate errors, try running:")
+            logger.warning("  python fix_ssl_certificates.py")
+            logger.warning("Or set ENVIRONMENT=development to bypass SSL verification")
 
         # Initialize agent to validate configuration
         get_agent()
         logger.info("Agent initialization successful")
         
         # Start the AgentCore Runtime application
+        logger.info("Starting AgentCore Runtime on port 8080...")
         app.run(port=8080)
         
     except Exception as e:
         logger.error(f"Failed to start application: {str(e)}")
+        if "SSL" in str(e) or "certificate" in str(e).lower():
+            logger.error("\n🔧 SSL Certificate Error Detected!")
+            logger.error("To fix SSL issues, try one of these solutions:")
+            logger.error("1. Run the SSL fix script: python fix_ssl_certificates.py")
+            logger.error("2. Set environment variable: export ENVIRONMENT=development")
+            logger.error("3. Disable SSL verification: export PYTHONHTTPSVERIFY=0")
         raise

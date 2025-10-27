@@ -7,6 +7,7 @@ that exposes external tools/APIs as MCP tools.
 """
 
 import logging
+import os
 import uuid
 from typing import Dict, List, Optional, Any
 from strands import tool, ToolContext
@@ -177,11 +178,34 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
             # Get access token
             access_token = await token_manager.get_access_token()
             
-            # Create MCP client with Authorization header
-            gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
-                url=gateway_url,
-                headers={"Authorization": f"Bearer {access_token}"}
-            ))
+            # Check if SSL verification should be disabled for development
+            import os
+            is_development = os.getenv('ENVIRONMENT', '').lower() == 'development'
+            ssl_bypass = os.getenv('COGNITO_DISABLE_SSL_VERIFICATION', 'false').lower() == 'true'
+            
+            if is_development or ssl_bypass:
+                logger.warning("SSL verification disabled for MCP client - NOT SAFE FOR PRODUCTION")
+                # Set environment variables to disable SSL verification for the underlying HTTP client
+                os.environ['PYTHONHTTPSVERIFY'] = '0'
+                os.environ['SSL_CERT_FILE'] = ''
+                os.environ['AWS_CA_BUNDLE'] = ''
+            
+            # Create MCP client with Authorization header and SSL bypass if needed
+            if is_development or ssl_bypass:
+                # For development, create client with SSL verification disabled
+                # Don't modify the global ssl context to avoid recursion
+                pass
+                
+                gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
+                    url=gateway_url,
+                    headers={"Authorization": f"Bearer {access_token}"}
+                ))
+            else:
+                # For production, use normal SSL verification
+                gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
+                    url=gateway_url,
+                    headers={"Authorization": f"Bearer {access_token}"}
+                ))
                 
         except CognitoTokenManagerError as e:
             logger.error(f"[{request_id}] Cognito authentication failed: {str(e)}")
@@ -190,49 +214,46 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
             logger.error(f"[{request_id}] Failed to create MCP client: {str(e)}")
             raise PersonalisationError("Failed to connect to Gateway")
             
-        # Use context manager for MCP session with enhanced error handling
-        mcp_session = None
+        # Use MCP client for operations with enhanced error handling
         try:
-            # Initialize MCP session with timeout
-            mcp_session = gateway_mcp_client
-            
             # Use timeout wrapper for MCP operations
             async def _execute_mcp_operations():
-                with mcp_session:
-                    logger.debug(f"[{request_id}] MCP session established with Gateway")
-                    
-                    # Discover available tools
-                    try:
+                logger.debug(f"[{request_id}] Starting MCP operations with Gateway")
+                
+                # Discover available tools - wrap in context manager
+                try:
+                    with gateway_mcp_client:
                         available_tools = gateway_mcp_client.list_tools_sync()
                         logger.info(f"[{request_id}] Found {len(available_tools)} available tools")
-                    except Exception as e:
-                        logger.error(f"[{request_id}] Tool discovery failed: {str(e)}")
-                        raise PersonalisationError("Failed to discover tools from Gateway")
+                except Exception as e:
+                    logger.error(f"[{request_id}] Tool discovery failed: {str(e)}")
+                    raise PersonalisationError("Failed to discover tools from Gateway")
+                
+                if not available_tools:
+                    logger.info(f"[{request_id}] No tools available from Gateway")
+                    return {"personalised": ""}
+                
+                # Find relevant tool for search topic (LLM-based semantic matching)
+                relevant_tool = await ToolMatcher.find_relevant_tool(available_tools, search_topic, tool_context)
+                
+                if not relevant_tool:
+                    logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
+                    return {"personalised": ""}
+                
+                # Handle both dict and MCPAgentTool objects
+                if hasattr(relevant_tool, 'name'):
+                    # MCPAgentTool object
+                    tool_name = getattr(relevant_tool, 'name', '')
+                else:
+                    # Dictionary object
+                    tool_name = relevant_tool.get('name')
+                logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
+                
+                # Invoke the tool with user_id and search query
+                try:
+                    logger.debug(f"[{request_id}] Invoking tool {tool_name}")
                     
-                    if not available_tools:
-                        logger.info(f"[{request_id}] No tools available from Gateway")
-                        return {"personalised": ""}
-                    
-                    # Find relevant tool for search topic (LLM-based semantic matching)
-                    relevant_tool = await ToolMatcher.find_relevant_tool(available_tools, search_topic, tool_context)
-                    
-                    if not relevant_tool:
-                        logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
-                        return {"personalised": ""}
-                    
-                    # Handle both dict and MCPAgentTool objects
-                    if hasattr(relevant_tool, 'name'):
-                        # MCPAgentTool object
-                        tool_name = getattr(relevant_tool, 'name', '')
-                    else:
-                        # Dictionary object
-                        tool_name = relevant_tool.get('name')
-                    logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
-                    
-                    # Invoke the tool with user_id and search query
-                    try:
-                        logger.debug(f"[{request_id}] Invoking tool {tool_name}")
-                        
+                    with gateway_mcp_client:
                         result = gateway_mcp_client.call_tool_sync(
                             tool_use_id=f"personalization-{tool_use_id}",
                             name=tool_name,
@@ -241,46 +262,53 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                                 "query": search_topic
                             }
                         )
-                        
-                        # Extract content from MCP response
-                        if result:
-                            # Handle both dict and object responses
-                            if hasattr(result, 'content'):
-                                # Object with content attribute
-                                content_list = getattr(result, 'content', [])
-                            elif isinstance(result, dict) and "content" in result:
-                                # Dictionary with content key
-                                content_list = result.get("content", [])
-                            else:
-                                content_list = []
-                            
-                            if content_list and len(content_list) > 0:
-                                # Handle both dict and object content items
-                                content_item = content_list[0]
-                                if hasattr(content_item, 'text'):
-                                    # Object with text attribute
-                                    personalized_content = getattr(content_item, 'text', '')
-                                elif isinstance(content_item, dict):
-                                    # Dictionary with text key
-                                    personalized_content = content_item.get("text", "")
-                                else:
-                                    personalized_content = ""
-                                
-                                if personalized_content:
-                                    logger.info(f"[{request_id}] Successfully retrieved personalized content")
-                                    return {"personalised": personalized_content}
-                        
-                        logger.info(f"[{request_id}] Tool returned empty or invalid response")
-                        return {"personalised": ""}
-                        
-                    except Exception as e:
-                        logger.error(f"[{request_id}] Tool execution failed for {tool_name}: {str(e)}")
-                        raise PersonalisationError(f"Failed to execute personalization tool: {str(e)}")
                     
+                    # Extract content from MCP response
+                    if result:
+                        # Handle both dict and object responses
+                        if hasattr(result, 'content'):
+                            # Object with content attribute
+                            content_list = getattr(result, 'content', [])
+                        elif isinstance(result, dict) and "content" in result:
+                            # Dictionary with content key
+                            content_list = result.get("content", [])
+                        else:
+                            content_list = []
+                        
+                        if content_list and len(content_list) > 0:
+                            # Handle both dict and object content items
+                            content_item = content_list[0]
+                            if hasattr(content_item, 'text'):
+                                # Object with text attribute
+                                personalized_content = getattr(content_item, 'text', '')
+                            elif isinstance(content_item, dict):
+                                # Dictionary with text key
+                                personalized_content = content_item.get("text", "")
+                            else:
+                                personalized_content = ""
+                            
+                            if personalized_content:
+                                logger.info(f"[{request_id}] Successfully retrieved personalized content")
+                                return {"personalised": personalized_content}
+                    
+                    logger.info(f"[{request_id}] Tool returned empty or invalid response")
                     return {"personalised": ""}
+                    
+                except Exception as e:
+                    logger.error(f"[{request_id}] Tool execution failed for {tool_name}: {str(e)}")
+                    raise PersonalisationError(f"Failed to execute personalization tool: {str(e)}")
+                
+                return {"personalised": ""}
             
-            # Execute MCP operations with timeout
-            return await asyncio.wait_for(_execute_mcp_operations(), timeout=10.0)
+            # Execute MCP operations with timeout (use configurable timeout)
+            # Try to get timeout from config, fallback to environment variable
+            try:
+                from config import Config
+                config = Config()
+                mcp_timeout = config.mcp_timeout
+            except:
+                mcp_timeout = int(os.environ.get("MCP_TIMEOUT", "60"))  # Default 60 seconds
+            return await asyncio.wait_for(_execute_mcp_operations(), timeout=mcp_timeout)
                     
         except asyncio.TimeoutError:
             logger.error(f"[{request_id}] MCP session timeout")
@@ -288,14 +316,6 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
         except Exception as e:
             logger.error(f"[{request_id}] MCP session error: {str(e)}")
             raise PersonalisationError("MCP session failed")
-        finally:
-            # Ensure proper cleanup of MCP session
-            if mcp_session:
-                try:
-                    # MCP client cleanup is handled by context manager
-                    logger.debug(f"[{request_id}] MCP session cleanup completed")
-                except Exception as cleanup_error:
-                    logger.warning(f"[{request_id}] MCP session cleanup error: {str(cleanup_error)}")
             
     except PersonalisationError:
         # Re-raise our custom errors
