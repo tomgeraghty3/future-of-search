@@ -47,11 +47,21 @@ class ToolMatcher:
         # Prepare tool descriptions for LLM analysis
         tools_summary = []
         for i, tool in enumerate(available_tools):
-            tool_info = {
-                "index": i,
-                "name": tool.get('name', ''),
-                "description": tool.get('description', '')
-            }
+            # Handle both dict and MCPAgentTool objects
+            if hasattr(tool, 'name'):
+                # MCPAgentTool object
+                tool_info = {
+                    "index": i,
+                    "name": getattr(tool, 'name', ''),
+                    "description": getattr(tool, 'description', '')
+                }
+            else:
+                # Dictionary object
+                tool_info = {
+                    "index": i,
+                    "name": tool.get('name', ''),
+                    "description": tool.get('description', '')
+                }
             tools_summary.append(tool_info)
         
         # Create prompt for LLM to select the most relevant tool
@@ -76,11 +86,13 @@ Respond with ONLY the index number of the most relevant tool, or "NONE" if no to
             
             # Parse the response
             if response_text.upper() == "NONE":
+                logger.info("The LLM returned a response of NONE for Personalisation - there is no tool in the Gateway for this query")
                 return None
                 
             try:
                 selected_index = int(response_text)
                 if 0 <= selected_index < len(available_tools):
+                    logger.info(f"The LLM returned a response of {selected_index} for this query. This is tool: {available_tools[selected_index]}")
                     return available_tools[selected_index]
                 else:
                     logger.warning(f"LLM returned invalid tool index: {selected_index}")
@@ -91,51 +103,9 @@ Respond with ONLY the index number of the most relevant tool, or "NONE" if no to
                 
         except Exception as e:
             logger.error(f"Error using LLM for tool selection: {str(e)}")
-            # Fallback to simple keyword matching if LLM fails
-            return ToolMatcher._fallback_keyword_matching(available_tools, search_topic)
+            raise PersonalisationError(f"Failed to select relevant tool using LLM: {str(e)}")
     
-    @staticmethod
-    def _fallback_keyword_matching(available_tools: List[Dict], search_topic: str) -> Optional[Dict]:
-        """
-        Fallback keyword-based matching when LLM is unavailable.
-        
-        Args:
-            available_tools: List of available MCP tools from Gateway
-            search_topic: User's search query
-            
-        Returns:
-            Most relevant tool dict or None if no match found
-        """
-        search_topic_lower = search_topic.lower()
-        best_match = None
-        best_score = 0
-        
-        for tool in available_tools:
-            tool_name = tool.get('name', '').lower()
-            tool_description = tool.get('description', '').lower()
-            
-            score = 0
-            
-            # Check for direct keyword matches in tool name
-            if any(keyword in tool_name for keyword in search_topic_lower.split()):
-                score += 3
-                
-            # Check for keyword matches in description
-            if any(keyword in tool_description for keyword in search_topic_lower.split()):
-                score += 2
-                
-            # Check for common personalization keywords
-            personalization_keywords = ['account', 'profile', 'user', 'personal', 'history', 'preference']
-            if any(keyword in search_topic_lower for keyword in personalization_keywords):
-                if any(keyword in tool_name or keyword in tool_description for keyword in personalization_keywords):
-                    score += 1
-                    
-            if score > best_score:
-                best_score = score
-                best_match = tool
-                
-        # Only return a match if we have a reasonable confidence
-        return best_match if best_score >= 2 else None
+
 
 
 @tool(context=True)
@@ -250,7 +220,13 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                         logger.info(f"[{request_id}] No relevant personalization tool found for topic: {search_topic}")
                         return {"personalised": ""}
                     
-                    tool_name = relevant_tool.get('name')
+                    # Handle both dict and MCPAgentTool objects
+                    if hasattr(relevant_tool, 'name'):
+                        # MCPAgentTool object
+                        tool_name = getattr(relevant_tool, 'name', '')
+                    else:
+                        # Dictionary object
+                        tool_name = relevant_tool.get('name')
                     logger.info(f"[{request_id}] Found relevant tool: {tool_name}")
                     
                     # Invoke the tool with user_id and search query
@@ -267,10 +243,29 @@ async def personalisation_tool(search_topic: str, user_id: str, tool_context: To
                         )
                         
                         # Extract content from MCP response
-                        if result and "content" in result:
-                            content_list = result.get("content", [])
+                        if result:
+                            # Handle both dict and object responses
+                            if hasattr(result, 'content'):
+                                # Object with content attribute
+                                content_list = getattr(result, 'content', [])
+                            elif isinstance(result, dict) and "content" in result:
+                                # Dictionary with content key
+                                content_list = result.get("content", [])
+                            else:
+                                content_list = []
+                            
                             if content_list and len(content_list) > 0:
-                                personalized_content = content_list[0].get("text", "")
+                                # Handle both dict and object content items
+                                content_item = content_list[0]
+                                if hasattr(content_item, 'text'):
+                                    # Object with text attribute
+                                    personalized_content = getattr(content_item, 'text', '')
+                                elif isinstance(content_item, dict):
+                                    # Dictionary with text key
+                                    personalized_content = content_item.get("text", "")
+                                else:
+                                    personalized_content = ""
+                                
                                 if personalized_content:
                                     logger.info(f"[{request_id}] Successfully retrieved personalized content")
                                     return {"personalised": personalized_content}

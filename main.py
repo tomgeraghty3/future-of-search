@@ -912,8 +912,81 @@ async def test_gateway_connection():
         return None
 
 
+async def test_personalisation_direct(search_topic: str, user_id: str = None):
+    """
+    Direct test function for personalisation tool - can be called from main().
+    
+    Args:
+        search_topic: The search query to test
+        user_id: Optional user ID for personalization
+    """
+    try:
+        logger.info(f"=== DIRECT PERSONALISATION TEST ===")
+        logger.info(f"Search topic: {search_topic}")
+        logger.info(f"User ID: {user_id or 'None (anonymous)'}")
+        
+        # Load configuration
+        config = get_config()
+        
+        # Create a minimal tool context for testing
+        class TestToolContext:
+            def __init__(self, config):
+                self.invocation_state = config.to_dict()
+                self.invocation_state["request_id"] = "direct-test-123"
+                self.tool_use = {"toolUseId": "test-tool-use-123"}
+                
+                # Initialize LLM for tool matching
+                self.llm = BedrockModel(
+                    model_id="anthropic.claude-3-sonnet-20240229-v1:0",
+                    temperature=0.1,
+                    max_tokens=1000
+                )
+        
+        tool_context = TestToolContext(config)
+        
+        logger.info("Calling personalisation_tool directly...")
+        
+        # Import and call the personalisation tool
+        from tools.personalisation_tool import personalisation_tool, PersonalisationError
+        
+        result = await personalisation_tool(
+            search_topic=search_topic,
+            user_id=user_id or "",
+            tool_context=tool_context
+        )
+        
+        logger.info("=== PERSONALISATION TEST COMPLETED ===")
+        logger.info(f"Result: {result}")
+        
+        return result
+        
+    except PersonalisationError as e:
+        logger.error(f"Personalisation tool error: {str(e)}")
+        return {"personalised": "", "error": str(e)}
+    except Exception as e:
+        logger.error(f"Unexpected error in direct test: {str(e)}")
+        return {"personalised": "", "error": f"Unexpected error: {str(e)}"}
+
+
 if __name__ == "__main__":
     """Local development entry point with enhanced logging."""
+    import sys
+    
+    # Check if we want to run a direct test
+    if len(sys.argv) > 1 and sys.argv[1] == "test-personalisation":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py test-personalisation <search_topic> [user_id]")
+            print("Example: python main.py test-personalisation 'laptop recommendations' 'user123'")
+            sys.exit(1)
+        
+        search_topic = sys.argv[2]
+        user_id = sys.argv[3] if len(sys.argv) > 3 else None
+        
+        print(f"Running direct personalisation test...")
+        result = asyncio.run(test_personalisation_direct(search_topic, user_id))
+        print(f"\nFinal result: {result}")
+        sys.exit(0)
+    
     try:
         logger.info("Starting Customer Search Agent in local development mode")
         
