@@ -11,6 +11,9 @@ import base64
 import json
 import logging
 import socket
+import ssl
+import certifi
+import os
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -48,6 +51,9 @@ class CognitoTokenManager:
         self.token_endpoint = f"https://{self.token_endpoint_host}/oauth2/token"
         self.discovery_endpoint = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/openid-configuration"
         
+        # Configure SSL context for proper certificate handling
+        self._setup_ssl_context()
+        
         # Token storage
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
@@ -81,6 +87,39 @@ class CognitoTokenManager:
         if any(word in self.domain.lower() for word in reserved_words):
             raise ValueError(f"Domain cannot contain reserved words: {reserved_words}")
     
+    def _setup_ssl_context(self):
+        """Setup SSL context for proper certificate handling on macOS and other platforms."""
+        try:
+            # Check for development environment or explicit SSL bypass first
+            is_development = os.getenv('ENVIRONMENT', 'development') == 'development'
+            ssl_bypass = os.getenv('COGNITO_DISABLE_SSL_VERIFICATION', 'false').lower() == 'true'
+            
+            if is_development or ssl_bypass:
+                logger.warning("SSL verification disabled for development environment - NOT SAFE FOR PRODUCTION")
+                self._http_verify = False  # Disable SSL verification for development
+                self._allow_unverified_ssl = True
+                return
+            
+            # Create SSL context with proper certificate verification for production
+            self._ssl_context = ssl.create_default_context()
+            
+            # Try to use certifi bundle if available
+            try:
+                self._ssl_context.load_verify_locations(certifi.where())
+                logger.debug("Using certifi certificate bundle for SSL verification")
+            except Exception as e:
+                logger.debug(f"Could not load certifi bundle: {e}, using system defaults")
+            
+            # Configure HTTPX to use our SSL context
+            self._http_verify = self._ssl_context
+            self._allow_unverified_ssl = False
+            
+        except Exception as e:
+            logger.warning(f"SSL context setup failed: {e}, falling back to default verification")
+            # Fallback to default verification
+            self._http_verify = True
+            self._allow_unverified_ssl = False
+    
     def _test_dns_resolution(self) -> Tuple[bool, Optional[str]]:
         """Test if the token endpoint hostname can be resolved."""
         try:
@@ -106,7 +145,8 @@ class CognitoTokenManager:
             return results
         
         # Test HTTP connectivity
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        verify_setting = False if self._allow_unverified_ssl else self._http_verify
+        async with httpx.AsyncClient(timeout=10.0, verify=verify_setting) as client:
             # Test token endpoint (expect 405 for GET)
             try:
                 response = await client.get(self.token_endpoint)
@@ -186,7 +226,9 @@ class CognitoTokenManager:
         logger.debug(f"Request data: {data}")
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # Use the configured SSL context or bypass if requested
+            verify_setting = False if self._allow_unverified_ssl else self._http_verify
+            async with httpx.AsyncClient(timeout=30.0, verify=verify_setting) as client:
                 response = await client.post(
                     self.token_endpoint,
                     headers=headers,

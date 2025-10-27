@@ -8,6 +8,14 @@ botocore
 
 # HTTP client for MCP Gateway communication
 httpx
+httpx==0.27.2
+httpx-sse==0.4.0
+
+# SSL certificate handling
+certifi
+
+# Environment variable handling
+python-dotenv
 
 # Data validation and serialization
 pydantic

@@ -36,8 +36,10 @@ class Config:
         # AWS Region configuration
         self.aws_region = os.environ.get("AWS_REGION", "us-east-1")
         
-        # Runtime configuration
-        self.response_timeout = int(os.environ.get("RESPONSE_TIMEOUT", "8"))
+        # Runtime configuration with enhanced timeout settings
+        self.response_timeout = int(os.environ.get("RESPONSE_TIMEOUT", "120"))  # Increased default
+        self.mcp_timeout = int(os.environ.get("MCP_TIMEOUT", "60"))  # MCP client timeout
+        self.http_timeout = int(os.environ.get("HTTP_TIMEOUT", "120"))  # HTTP client timeout
         self.agent_name = os.environ.get("AGENT_NAME", "customer-search-agent")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         
