@@ -10,12 +10,15 @@ It must end with one of:
 """
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 import boto3
 from strands.tools import tool
 from strands import ToolContext
 
+
+logger = logging.getLogger(__name__)
 
 # --- System prompt with concise, good-practice guardrails --- #
 SYSTEM_GUARDRAILS = """
@@ -72,63 +75,72 @@ async def guardrails_tool(
       - rationale: brief reason
       - raw_json: original parsed JSON from the model
     """
-    # --- Config (simple, overridable via invocation_state) --- #
-    inv = getattr(tool_context, "invocation_state", {}) or {}
-    region = inv.get("AWS_REGION", "us-east-1")
-    model_id = inv.get("model_id", "anthropic.claude-3-5-sonnet-20241022-v2:0")  # change if needed
-
-    # --- Compose the single user message --- #
-    user_block = _build_user_guardrails_block(user_guardrails)
-    user_message = f"""
-Evaluate the following CONTENT against the guardrails.
-
-{user_block}
-
-CONTENT:
-\"\"\"{response_content}\"\"\"
-""".strip()
-
-    # --- Call Bedrock (Converse API) --- #
-    bedrock = boto3.client("bedrock-runtime", region_name=region)
-
-    resp = bedrock.converse(
-        modelId=model_id,
-        system=[{"text": SYSTEM_GUARDRAILS}],
-        messages=[{"role": "user", "content": [{"text": user_message}]}],
-    )
-
-    text_out = resp["output"]["message"]["content"][0]["text"]
-
-    # --- Parse the JSON response from the model --- #
     try:
-        payload = json.loads(text_out)
-    except json.JSONDecodeError:
-        # If the model returned non-JSON, fail safely with a rejection
-        payload = {
-            "decision": "reject",
-            "changes": [],
-            "rationale": "Model did not return valid JSON as required by the guardrails prompt.",
-        }
+      # --- Config (simple, overridable via invocation_state) --- #
+      inv = getattr(tool_context, "invocation_state", {}) or {}
+      region = inv.get("AWS_REGION", "us-east-1")
+      model_id = inv.get("model_id", "anthropic.claude-3-sonnet-20240229-v1:0")
 
-    decision = (payload.get("decision") or "").strip().lower()
-    changes = payload.get("changes") or []
-    rationale = payload.get("rationale") or ""
+      # --- Compose the single user message --- #
+      user_block = _build_user_guardrails_block(user_guardrails)
+      user_message = f"""
+        Evaluate the following CONTENT against the guardrails.
+        
+        {user_block}
+        
+        CONTENT:
+        \"\"\"{response_content}\"\"\"
+        """.strip()
 
-    # --- Normalize to final human-readable result --- #
-    if decision == "accept":
-        result = "Accepted"
-    elif decision == "accept_with_changes":
-        if changes:
-            bullet_list = "\n- " + "\n- ".join(changes)
-            result = f"Accepted with changes ({bullet_list})"
-        else:
-            result = "Accepted with changes (no specific changes provided)"
-    else:
-        result = "Rejected"
+      # --- Call Bedrock (Converse API) --- #
+      bedrock = boto3.client("bedrock-runtime", region_name=region)
 
-    return {
-        "result": result,
-        "changes": changes,
-        "rationale": rationale,
-        "raw_json": payload,
-    }
+      logger.info(f"Calling LLM with model: {model_id}")
+      resp = bedrock.converse(
+          modelId=model_id,
+          system=[{"text": SYSTEM_GUARDRAILS}],
+          messages=[{"role": "user", "content": [{"text": user_message}]}],
+      )
+
+      text_out = resp["output"]["message"]["content"][0]["text"]
+
+      # --- Parse the JSON response from the model --- #
+      try:
+          payload = json.loads(text_out)
+      except json.JSONDecodeError as e:
+          # If the model returned non-JSON, fail safely with a rejection
+          logger.error(f"Unable to decode the JSON payload. Error: {e}")
+          payload = {
+              "decision": "reject",
+              "changes": [],
+              "rationale": "Model did not return valid JSON as required by the guardrails prompt.",
+          }
+
+      decision = (payload.get("decision") or "").strip().lower()
+      changes = payload.get("changes") or []
+      rationale = payload.get("rationale") or ""
+
+      # --- Normalize to final human-readable result --- #
+      if decision == "accept":
+          result = "Accepted"
+      elif decision == "accept_with_changes":
+          if changes:
+              bullet_list = "\n- " + "\n- ".join(changes)
+              result = f"Accepted with changes ({bullet_list})"
+          else:
+              result = "Accepted with changes (no specific changes provided)"
+      else:
+          result = "Rejected"
+
+      return_result = {
+          "result": result,
+          "changes": changes,
+          "rationale": rationale,
+          "raw_json": payload,
+      }
+
+      logger.info(f"\nIN:\"{response_content}\"\nOUT:\n\"{return_result}\"")
+
+      return return_result
+    except Exception as e:
+      logger.error(f"The guardrails tool failed. Error: {e}")

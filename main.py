@@ -131,7 +131,10 @@ class CustomerSearchAgent:
         self.config = config
         self.agent = None
         self._mcp_sessions = {}  # Track MCP sessions for proper cleanup
+        self._gateway_mcp_client = None  # Pre-initialized Gateway MCP client
+        self._available_tools = []  # Pre-discovered Gateway tools
         self._initialize_agent()
+        self._initialize_gateway_connection()
     
     def _initialize_agent(self):
         """Initialize the Strands Agent with system prompt and tools."""
@@ -146,15 +149,15 @@ Help SP customers find the most accurate, relevant, and trustworthy information.
 Knowledge Tool – Search the official SP knowledge base for authoritative, approved information.
 Personalisation Tool – Retrieve personalised details for authenticated customers (optional, fail gracefully if unavailable).
 Guardrail Tool – Validate responses for safety and accuracy (use once at the end).
-You can call "Knowledge Tool" and "Personalisation Tool" in parallel.
 Do not respond to any queries that are not relevant to your goal
 
 ## Efficient Process
 1. Always start with the Knowledge Tool to get factual information
 2. Try Personalisation Tool only if user_id is provided (skip if it fails quickly)
-3. Create your final response using the gathered information
-4. Use Guardrails Tool to validate your draft response content
-5. Return the final response - NO MORE TOOL CALLING after guardrails
+3. If the Knowledge Tool does NOT return factual or relevant information or returns "I am unable to assist you with this request" then do not call the Personalisation Tool 
+4. Create your final response using the gathered information
+5. Use Guardrails Tool to validate your draft response content
+6. Return the final response - NO MORE TOOL CALLING after guardrails
 
 ## Response Format
 Always respond in this exact JSON format:
@@ -165,10 +168,11 @@ Always respond in this exact JSON format:
 }
 
 ## Important Guidelines
-- Prioritize speed and accuracy over completeness
+- Prioritise speed and accuracy over completeness
 - Don't retry failed tools - fail fast and continue
 - Always include knowledge base information in your summary
-- Provide helpful responses even when personalization fails
+- Provide helpful responses even when personalisation fails
+- Only call the Personalisation Tool if the Knowledge Tool does not fail
 - Never provide a general response
 - Include source links when available
 - Keep responses factual and based on official SP information
@@ -203,6 +207,70 @@ After calling the guardrails tool, immediately provide your final JSON response.
         )
         
         logger.info(f"Initialized Customer Search Agent: {self.config.agent_name} with Claude 3.7 Sonnet")
+    
+    def _initialize_gateway_connection(self):
+        """Initialize Gateway MCP connection and discover available tools during startup."""
+        gateway_url = self.config.gateway_mcp_url
+        
+        if not gateway_url:
+            raise ValueError("Gateway MCP URL not configured - GATEWAY_MCP_URL environment variable is required")
+        
+        # Check if we have Cognito configuration for authentication
+        cognito_config = {
+            'user_pool_id': self.config.cognito_user_pool_id,
+            'client_id': self.config.cognito_client_id,
+            'client_secret': self.config.cognito_client_secret,
+            'domain': self.config.cognito_domain,
+            'region': self.config.cognito_region
+        }
+        
+        # Check if all required Cognito config is present
+        missing_config = [k for k, v in cognito_config.items() if not v]
+        
+        if missing_config:
+            raise ValueError(f"Missing required Cognito configuration for Gateway authentication: {missing_config}")
+        
+        try:
+            
+            # Create authenticated MCP client during startup
+            logger.info("Initializing Gateway MCP connection during startup")
+            
+            from tools.cognito_token_manager import CognitoTokenManager, CognitoTokenManagerError
+            
+            token_manager = CognitoTokenManager(
+                user_pool_id=cognito_config['user_pool_id'],
+                client_id=cognito_config['client_id'],
+                client_secret=cognito_config['client_secret'],
+                region=cognito_config['region'],
+                domain=cognito_config['domain']
+            )
+            
+            # Get access token during startup
+            import asyncio
+            access_token = asyncio.run(token_manager.get_access_token())
+            
+            # Create MCP client with Authorization header
+            self._gateway_mcp_client = MCPClient(lambda: streamablehttp_client(
+                url=gateway_url,
+                headers={"Authorization": f"Bearer {access_token}"}
+            ))
+            
+            # Discover available tools during startup
+            with self._gateway_mcp_client:
+                self._available_tools = self._gateway_mcp_client.list_tools_sync()
+                logger.info(f"Successfully discovered {len(self._available_tools)} Gateway tools during startup")
+                
+                # Log tool details for debugging
+                for i, tool in enumerate(self._available_tools):
+                    tool_name = getattr(tool, 'tool_name', getattr(tool, 'name', 'Unknown'))
+                    logger.info(f"  Tool {i+1}: {tool_name}")
+            
+        except CognitoTokenManagerError as e:
+            logger.error(f"Gateway authentication failed during startup: {str(e)}")
+            raise RuntimeError(f"Gateway authentication failed: {str(e)}") from e
+        except Exception as e:
+            logger.error(f"Failed to initialize Gateway connection during startup: {str(e)}")
+            raise RuntimeError(f"Failed to initialize Gateway connection: {str(e)}") from e
     
     @asynccontextmanager
     async def _correlation_context(self, correlation_id: str):
@@ -250,7 +318,9 @@ After calling the guardrails tool, immediately provide your final JSON response.
                 invocation_state = {
                     **self.config.to_dict(),
                     "user_id": user_id,
-                    "request_id": correlation_id
+                    "request_id": correlation_id,
+                    "gateway_mcp_client": self._gateway_mcp_client,
+                    "available_tools": self._available_tools
                 }
                 
                 # Construct enhanced prompt for the agent with reasoning context
@@ -259,12 +329,13 @@ After calling the guardrails tool, immediately provide your final JSON response.
 Use your advanced reasoning capabilities to provide the most helpful response:
 
 REASONING STEPS:
-1. Analyze what specific information this user needs for their search topic
+1. Analyse what specific information this user needs for their search topic
 2. Use knowledge_tool to search for authoritative information about "{search_topic}"
 3. {"Consider using personalisation_tool to enhance the response with user-specific information for user_id: " + user_id if user_id else "Skip personalization since this is an anonymous user"}
 4. Synthesize all gathered information into a comprehensive, accurate response
 5. Use guardrails_tool to validate your draft response content for safety and coherence
 6. Return your final JSON response immediately after guardrails validation - NO MORE TOOLS
+7. If the Knowledge Tool does NOT return factual or relevant information or returns "I am unable to assist you with this request" then do not call the Personalisation Tool
 
 QUALITY REQUIREMENTS:
 - Prioritize accuracy and cite sources when available
@@ -299,7 +370,7 @@ Return your final response in the exact JSON format specified in your system pro
                             "links": []
                         }
 
-                    logger.info("Successfully processed search request")
+                    logger.info("\nSuccessfully processed search request")
                     return result
 
                 except asyncio.TimeoutError:
@@ -339,7 +410,9 @@ Return your final response in the exact JSON format specified in your system pro
             invocation_state = {
                 **self.config.to_dict(),
                 "user_id": None,
-                "request_id": correlation_id
+                "request_id": correlation_id,
+                "gateway_mcp_client": self._gateway_mcp_client,
+                "available_tools": self._available_tools
             }
             
             # Simplified prompt for knowledge-only search
@@ -773,7 +846,7 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         result["correlation_id"] = correlation_id
         
         # Log successful completion
-        logger.info(f"Search request completed successfully")
+        logger.info(f"Search request completed successfully for correlation: {correlation_id}")
         return result
         
     except asyncio.TimeoutError:
